@@ -62,3 +62,4 @@ CSVはUTF-8（BOM付き）で、Excelでそのまま開けます。
 
 - [Phase 1 設計（API仕様調査結果）](docs/phase1-design.md)
 - [開発ログ](docs/dev-log.md)
+- [開発上の注意事項](docs/dev-notes.md)（課税/免税ステータス等）
