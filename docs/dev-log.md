@@ -260,3 +260,22 @@ raw / n1 NFKC+casefold+空白整理 / n2 +記号を空白に / n3 +空白除去 
 - 高 accuracy の組み合わせ: 「exact・過去3回以上・主科目一致率100%・365日以内」で FY2022 98.9% / FY2023 97.8% / FY2024 97.2%（coverage 30〜37%）
 - 精度に効く特徴: 過去出現回数、主科目一致率、最終利用からの日数（>365日で大きく低下）、top3候補の主科目一致（fuzzy）
 - 実装中に n5 の日付マスクが記号除去後に行われていた不具合をテストで検出し修正
+
+## Phase 4: LLM による主科目推定の評価基盤（dry-run まで, 2026-09-27）
+
+LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `llm-run --approve` / `llm-eval`（`phase4.py`）。
+
+- 対象選定（FY2024, ローリング: 取引日より前の履歴のみ）
+  - 高confidence群（LLM対象外）321件: exact・過去3回以上・主科目一致率100%・最終利用365日以内
+  - LLM対象 606件: A 候補なし 182 / B fuzzy候補(≥70)のみ 53 / C 科目が割れている 343 / D 365日以上未使用 35（重複あり）
+  - その他 110件（exact・過去1〜2回で一致）はルールで推定
+  - fuzzy は常に最上位候補を返すため、類似度70未満は「候補なし」扱いに変更（dry-run で A 層が0件になる問題を修正）
+- payload: 摘要（マスク済み）、入出金、金額帯、取引日、口座の種類（銀行/カード等, 口座名は送らない）、過去の類似明細 最大8件（類似度・件数・最終利用日・主科目上位3）
+  - マスク: 7桁以上の数字、カード番号らしき並び、メール、電話番号。送信前チェックで残存0件
+  - 正解は `answers_not_sent.jsonl` に分離。payload に正解・仕訳ID・明細IDは含めない
+- 出力: JSON Schema（structured outputs）。主科目は利用可能な120科目の短縮コード（A001〜）の enum のみ → ローカルで MF の勘定科目IDに変換。confidence は 0〜1 にクリップ
+- モデル既定 `claude-opus-5`、adaptive thinking、effort=medium、`fallbacks: "default"`、system（指示+科目一覧）はプロンプトキャッシュ
+- dry-run サンプル 40件（A/B/C/D × simple/complex 各5件, seed固定）
+- 見積もり（ローカル概算）: system 約3,000 tokens（キャッシュ）+ user 平均約700 tokens/件、output 150〜1,200 tokens/件
+  - claude-opus-5: 40件 $0.37〜$1.42、LLM対象全606件 $5.3〜$21.2
+- `check_secrets.py` に Anthropic APIキー（`sk-ant-`）の検出を追加

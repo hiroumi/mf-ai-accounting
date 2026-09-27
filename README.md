@@ -47,6 +47,9 @@ mf report                        # 年度別の品質集計（値は表示しな
 mf analyze                       # Phase 2準備: 過去データのみでの相手科目推定の評価（exact content）
 mf analyze25                     # Phase 2.5: 直近重視・年度重み・方針変更検知・高信頼条件の比較
 mf analyze3                      # Phase 3: 正規化 + fuzzy matching による主科目推定の評価
+mf llm-prepare                   # Phase 4: LLM対象の選定・payload作成・コスト見積もり（APIは呼ばない）
+mf llm-run --approve             # Phase 4: 承認後のみ LLM を呼ぶ（Claude API）
+mf llm-eval --results results_claude-opus-5_medium.jsonl
 ```
 
 `--start YYYY-MM-DD --end YYYY-MM-DD` で少量取得の期間を指定できます。

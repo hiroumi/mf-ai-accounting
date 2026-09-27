@@ -10,8 +10,10 @@
 """
 
 import argparse
+import json
 import logging
 import sys
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -21,7 +23,7 @@ from .client import MFAccountingClient, MFApiError
 from .config import ConfigError, Settings, load_settings
 from .guard import ForbiddenRequestError, GuardedSession
 from .inspect_json import format_summary, summarize, value_counts
-from . import phase2, phase3, phase25
+from . import phase2, phase3, phase4, phase25
 from .quality import format_report, quality_report
 from .validate import DataValidationError, validate_journals, validate_transactions
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
@@ -746,6 +748,155 @@ def cmd_analyze3(settings: Settings, args) -> None:
     print(f"\n派生データ: {out}")
 
 
+def _phase4_context(settings: Settings):
+    office_code = settings.require_office_code()
+    masters = _run_or_latest(settings, office_code, "masters", None)
+    jrun = _run_or_latest(settings, office_code, "journals", None)
+    trun = _run_or_latest(settings, office_code, "transactions", None)
+    terms = load_json(masters / "term_settings.json").get("term_settings") or []
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    accounts = load_json(masters / "accounts.json").get("accounts") or []
+    rows, _ = phase2.build_labels(_load_records(jrun, "journals"), _load_records(trun, "transactions"), terms, connected)
+    rows = [r for r in rows if r["fiscal_year"] is not None and 2018 <= r["fiscal_year"] <= 2024]
+    out = processed_dir(settings.data_dir, office_code) / "phase4"
+    return rows, accounts, out
+
+
+def _account_kind(bank_account_id: str | None, accounts_by_id: dict) -> str:
+    a = accounts_by_id.get(bank_account_id) or {}
+    if a.get("category") == "CASH_AND_DEPOSITS":
+        return "銀行口座"
+    if a.get("account_group") == "LIABILITY":
+        return "クレジットカード等（負債科目で管理）"
+    return "その他"
+
+
+def cmd_llm_prepare(settings: Settings, args) -> None:
+    """Phase 4 dry-run: 対象選定・payload 作成・コスト見積もり。LLM API は呼ばない。"""
+    rows, accounts, out = _phase4_context(settings)
+    target_fy = args.target_fy
+    by_id = {a["id"]: a for a in accounts}
+    names = {a["id"]: a.get("name") for a in accounts}
+    catalog = phase4.Catalog.from_accounts(accounts, available_only=True)
+    row_by_tx = {r["transaction_id"]: r for r in rows}
+
+    preds = phase3.rolling_predictions(rows, target_fy, phase4.NORMALIZER, "ratio")
+    enriched = []
+    for p in preds:
+        c = phase4.classify_target(p)
+        r = row_by_tx[p["transaction_id"]]
+        enriched.append({**p, **c, "tx_side": r["tx_side"], "tx_value": r["tx_value"], "bank_account_id": r["bank_account_id"]})
+    high = [t for t in enriched if t["high_confidence"]]
+    targets = [t for t in enriched if t["llm_target"]]
+    other = [t for t in enriched if not t["high_confidence"] and not t["llm_target"]]
+    cat_counts = Counter(c for t in targets for c in t["categories"])
+    unreachable = sum(1 for t in targets if t["actual"] not in catalog.id_to_code)
+
+    print(f"## 1. FY{target_fy} の対象選定（{len(enriched)}件）")
+    print(f"- 高confidence群（LLM対象外）: {len(high)}件 — exact・過去3回以上・主科目一致率100%・最終利用365日以内")
+    print(f"- LLM対象: {len(targets)}件（カテゴリ重複あり）: " + ", ".join(f"{k}={v}" for k, v in sorted(cat_counts.items())))
+    print(f"- その他（exact・過去1〜2回で一致、LLM対象外・ルールで推定）: {len(other)}件")
+    print(f"- LLM対象のうち、正解の主科目が現在利用不可（選択肢にない）: {unreachable}件")
+
+    sample = phase4.stratified_sample(targets, args.sample)
+    ordered = phase4.build_candidate_index(rows)
+    system = phase4.system_text(catalog)
+    schema = phase4.output_schema(catalog)
+    dry = out / "dry_run"
+    items, answers = [], []
+    for t in sample:
+        cands = phase4.candidates_before(ordered, t["tx_date"], t["tx_content"], catalog.id_to_code, names)
+        payload = phase4.build_payload({**t}, cands, _account_kind(t["bank_account_id"], by_id))
+        items.append({"transaction_id": t["transaction_id"], "categories": t["categories"], "payload": payload, "user_text": phase4.user_text(payload)})
+        answers.append({"transaction_id": t["transaction_id"], "actual_primary_account_id": t["actual"], "actual_code": catalog.id_to_code.get(t["actual"]),
+                        "actual_complex": t["actual_complex"], "categories": t["categories"], "rule_stage": t["stage"], "rule_pred": t["pred"]})
+    (dry / "system_prompt.txt").parent.mkdir(parents=True, exist_ok=True)
+    (dry / "system_prompt.txt").write_text(system, encoding="utf-8")
+    save_json(dry / "output_schema.json", schema)
+    save_json(dry / "catalog.json", {"code_to_id": catalog.code_to_id})
+    (dry / "payloads.jsonl").write_text("\n".join(json.dumps(i, ensure_ascii=False) for i in items) + "\n", encoding="utf-8")
+    (dry / "answers_not_sent.jsonl").write_text("\n".join(json.dumps(a, ensure_ascii=False) for a in answers) + "\n", encoding="utf-8")
+
+    # 送信前チェック（値は表示しない）
+    import re as _re
+    blob = "\n".join(i["user_text"] for i in items)
+    leaks = {
+        "7桁以上の数字": len(_re.findall(r"\d{7,}", blob)),
+        "メール": len(phase4._EMAIL.findall(blob)),
+        "電話番号": len(phase4._PHONE.findall(blob)),
+        "正解の仕訳ID/明細ID": sum(1 for i, a in zip(items, answers) if a["transaction_id"] in i["user_text"]),
+    }
+    sc = Counter((("B" if "B_fuzzy候補のみ" in t["categories"] else "A" if "A_候補なし" in t["categories"] else "C" if "C_科目が割れている" in t["categories"] else "D"), "complex" if t["actual_complex"] else "simple") for t in sample)
+    ncand = Counter(len(i["payload"]["past_similar_transactions"]) for i in items)
+    print(f"\n## 2. dry-run サンプル {len(sample)}件（層別抽出, seed固定）")
+    print("- 層（A=exactなし・候補なし（fuzzy<70含む）, B=exactなし・fuzzy候補(≥70)のみ, C=科目が割れている, D=長期未使用）×構造: " + ", ".join(f"{k[0]}/{k[1]}={v}" for k, v in sorted(sc.items())))
+    print(f"- 過去候補の件数分布: {dict(sorted(ncand.items()))}（最大 {phase4.MAX_CANDIDATES}件）")
+    print(f"- 選択可能な勘定科目: {len(catalog.rows)}（現在利用可能なもの, 短縮コード A001〜 → ローカルでMFのIDに変換）")
+    print(f"- 送信前チェック（マスク後の残存数）: " + ", ".join(f"{k}={v}" for k, v in leaks.items()))
+
+    sys_tok = phase4.estimate_tokens(system) + phase4.estimate_tokens(json.dumps(schema))
+    user_toks = [phase4.estimate_tokens(i["user_text"]) for i in items]
+    out_range = (150, 1200)  # JSON回答 + adaptive thinking（effort により変動）
+    print(f"\n## 3. トークン・コスト見積もり（ローカル概算, API未使用）")
+    print(f"- system（指示+科目一覧+スキーマ）: 約{sys_tok:,} tokens/件（プロンプトキャッシュ対象）")
+    print(f"- user（明細+過去候補）: 平均 約{sum(user_toks) // len(user_toks):,} / 最大 約{max(user_toks):,} tokens/件")
+    print(f"- output: 1件あたり {out_range[0]}〜{out_range[1]} tokens と仮定（構造化JSON + 思考トークン）")
+    print("| モデル | 対象 | input tokens | output tokens | 推定コスト（キャッシュあり） |")
+    print("|---|---:|---:|---:|---:|")
+    full_user = [sum(user_toks) // len(user_toks)] * len(targets)
+    for model in phase4.PRICES:
+        for label, ut in ((f"dry-run {len(items)}件", user_toks), (f"FY{target_fy} LLM対象 全{len(targets)}件（参考）", full_user)):
+            e = phase4.estimate_cost(model, sys_tok, ut, out_range)
+            lo, hi = e["cost_usd_range_with_cache"]
+            print(f"| {model} | {label} | 約{e['input_tokens']:,} | {e['output_tokens_range'][0]:,}〜{e['output_tokens_range'][1]:,} | ${lo:.2f}〜${hi:.2f} |")
+    print(f"\n確認用ファイル（ローカルのみ, Git管理外）: {dry}")
+    print("  system_prompt.txt / output_schema.json / payloads.jsonl（送信予定の内容）/ answers_not_sent.jsonl（正解, 送信しない）")
+
+
+def cmd_llm_run(settings: Settings, args) -> None:
+    rows, accounts, out = _phase4_context(settings)
+    dry = out / "dry_run"
+    items = [json.loads(l) for l in (dry / "payloads.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    catalog = phase4.Catalog.from_accounts(accounts, available_only=True)
+    if load_json(dry / "catalog.json")["code_to_id"] != catalog.code_to_id:
+        raise ConfigError("勘定科目カタログが dry-run 時と異なります。llm-prepare をやり直してください。")
+    system = (dry / "system_prompt.txt").read_text(encoding="utf-8")
+    schema = load_json(dry / "output_schema.json")
+    results = phase4.run_llm(items, system, schema, catalog, args.model, args.effort, approved=args.approve)
+    (dry / f"results_{args.model}_{args.effort}.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in results) + "\n", encoding="utf-8")
+    print(f"{len(results)}件 完了。保存先: {dry}")
+
+
+def cmd_llm_eval(settings: Settings, args) -> None:
+    """LLM 結果を正解（送信していないファイル）と照合する。件数・率のみ表示。"""
+    office_code = settings.require_office_code()
+    dry = processed_dir(settings.data_dir, office_code) / "phase4" / "dry_run"
+    res = {r["transaction_id"]: r for r in (json.loads(l) for l in (dry / args.results).read_text(encoding="utf-8").splitlines() if l.strip())}
+    ans = [json.loads(l) for l in (dry / "answers_not_sent.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    rows = []
+    for a in ans:
+        r = res.get(a["transaction_id"], {})
+        o = r.get("output") or {}
+        rows.append({**a, "llm_pred": o.get("primary_account_id"), "confidence": o.get("confidence"), "needs_review": o.get("needs_review"),
+                     "insufficient": o.get("insufficient_information"), "error": r.get("error")})
+    def acc(rs, key="llm_pred"):
+        rs = [x for x in rs if x[key]]
+        ok = sum(1 for x in rs if x[key] == x["actual_primary_account_id"])
+        return f"{ok}/{len(rs)} ({_pct(ok / len(rs) if rs else None)})"
+    print(f"LLM対象（サンプル）: {len(rows)}件 / 回答あり {sum(1 for x in rows if x['llm_pred'])} / エラー {sum(1 for x in rows if x['error'])} / insufficient_information {sum(1 for x in rows if x['insufficient'])}")
+    print(f"主科目 accuracy — LLM: {acc(rows)} / ルールのみ（同じ明細）: {acc(rows, 'rule_pred')}")
+    print("| 区分 | 値 | LLM accuracy |\n|---|---|---:|")
+    for title, key, order in (
+        ("confidence", lambda x: None if x["confidence"] is None else ">=0.9" if x["confidence"] >= 0.9 else "0.7-0.9" if x["confidence"] >= 0.7 else "<0.7", [">=0.9", "0.7-0.9", "<0.7"]),
+        ("needs_review", lambda x: x["needs_review"], [False, True]),
+        ("層", lambda x: next((c[0] for c in ("B_fuzzy候補のみ", "A_候補なし", "C_科目が割れている", "D_365日以上未使用") if c in x["categories"]), "?"), ["A", "B", "C", "D"]),
+        ("構造", lambda x: "complex" if x["actual_complex"] else "simple", ["simple", "complex"]),
+    ):
+        for k in order:
+            print(f"| {title} | {k} | {acc([x for x in rows if key(x) == k])} |")
+    save_json(dry / f"eval_{args.results.replace('.jsonl', '')}.json", {"rows": len(rows)})
+
+
 # ---- entry ------------------------------------------------------------------
 
 
@@ -803,6 +954,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("analyze3", help="Phase 3: 正規化 + fuzzy matching による主科目推定の評価（値は表示しない）")
     sp.set_defaults(func=cmd_analyze3)
 
+    sp = sub.add_parser("llm-prepare", help="Phase 4 dry-run: LLM対象選定・payload作成・コスト見積もり（APIは呼ばない）")
+    sp.add_argument("--target-fy", type=int, default=2024)
+    sp.add_argument("--sample", type=int, default=40)
+    sp.set_defaults(func=cmd_llm_prepare)
+
+    sp = sub.add_parser("llm-run", help="Phase 4: dry-run の payload で LLM を呼ぶ（--approve 必須）")
+    sp.add_argument("--model", default="claude-opus-5")
+    sp.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
+    sp.add_argument("--approve", action="store_true", help="コスト見積もりを確認・承認済みであることを示す")
+    sp.set_defaults(func=cmd_llm_run)
+
+    sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
+    sp.add_argument("--results", required=True, help="dry_run 内の results_*.jsonl")
+    sp.set_defaults(func=cmd_llm_eval)
+
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
     sp.add_argument("--transactions-run", help="明細の取得ディレクトリ（既定: 最新）")
@@ -823,6 +989,9 @@ def main(argv: list[str] | None = None) -> int:
     except ForbiddenRequestError as e:
         print(f"[ブロック] 書き込み防止ガードがリクエストを停止しました: {e}", file=sys.stderr)
         return 2
+    except PermissionError as e:
+        print(f"[停止] {e}", file=sys.stderr)
+        return 4
     except (ConfigError, AuthError, MFApiError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
