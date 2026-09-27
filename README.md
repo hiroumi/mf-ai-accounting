@@ -32,6 +32,7 @@ alias mf=".venv/bin/python -m mf_accounting"
 
 mf offices                       # Step 1: 認証と accessible_offices（事業者番号を確認し .env に設定）
 mf masters                       # Step 2: 事業者情報・会計期間・勘定科目・補助科目・税区分・部門・取引先・連携サービス
+mf counts                        #         各会計期間の仕訳件数のみ確認（内容は保存しない）
 mf journals --sample 10          # Step 3: 仕訳を少量取得（既定: 開始済みの最新会計期間）
 mf inspect journals              #         構造要約（値は表示しない）
 mf transactions --sample 10      # Step 4: 連携明細を少量取得

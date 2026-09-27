@@ -2,6 +2,7 @@
 
   offices        Step 1: 認証と accessible_offices の取得
   masters        Step 2: 事業者情報・会計期間・マスターの取得
+  counts         各会計期間の仕訳件数のみ確認（各期1件だけ取得し、内容は保存しない）
   journals       Step 3/6: 仕訳の取得（--sample N で少量 / --all で全期間）
   transactions   Step 4/6: 連携明細の取得（--sample N で少量 / --all で全期間）
   inspect        取得済みJSONの構造要約（値は表示しない）
@@ -109,6 +110,27 @@ def _default_sample_range(terms: list[dict]) -> tuple[date, date]:
 
 
 # ---- Step 3 / 6: journals ---------------------------------------------------
+
+
+def cmd_counts(settings: Settings, args) -> None:
+    """各期の仕訳総件数を metadata.total_count から確認する。仕訳の内容は保存・表示しない。"""
+    office_code = settings.require_office_code()
+    client = make_client(settings, office_code=office_code)
+    periods = ep.periods_from_term_settings(_load_terms(settings, client))
+    rows = []
+    for p in periods:
+        items, meta = ep.journals(client, p["start_date"], p["end_date"], per_page=1, max_items=1)
+        total = int(meta["total_count"] or 0)
+        first_kind = items[0].get("entered_by") if items else None
+        rows.append({"fiscal_year": p["fiscal_year"], "start_date": str(p["start_date"]), "end_date": str(p["end_date"]),
+                     "total_count": total, "first_entered_by": first_kind})
+    run = new_run_dir(settings.data_dir, office_code, "journal_counts")
+    write_manifest(run, office_code=office_code, periods=rows)
+    print(f"{'会計期間':26s} {'仕訳総件数':>8s}  1件目の種類")
+    for r in rows:
+        print(f"FY{r['fiscal_year']} {r['start_date']}〜{r['end_date']} {r['total_count']:>8}  {r['first_entered_by']}")
+    print(f"合計 {sum(r['total_count'] for r in rows)}件  保存先: {run}")
+
 
 
 def cmd_journals(settings: Settings, args) -> None:
@@ -276,6 +298,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("offices", help="Step 1: 認証と accessible_offices の取得").set_defaults(func=cmd_offices)
     sub.add_parser("masters", help="Step 2: 事業者情報・マスターの取得").set_defaults(func=cmd_masters)
+
+    sub.add_parser("counts", help="各会計期間の仕訳件数のみ確認").set_defaults(func=cmd_counts)
 
     for name, func in (("journals", cmd_journals), ("transactions", cmd_transactions)):
         sp = sub.add_parser(name, help=f"{name} の取得")
