@@ -21,7 +21,7 @@ from .client import MFAccountingClient, MFApiError
 from .config import ConfigError, Settings, load_settings
 from .guard import ForbiddenRequestError, GuardedSession
 from .inspect_json import format_summary, summarize, value_counts
-from . import phase2, phase25
+from . import phase2, phase3, phase25
 from .quality import format_report, quality_report
 from .validate import DataValidationError, validate_journals, validate_transactions
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
@@ -612,6 +612,140 @@ def cmd_analyze25(settings: Settings, args) -> None:
     print(f"\n派生データ: {out}")
 
 
+def cmd_analyze3(settings: Settings, args) -> None:
+    """Phase 3: 正規化 + fuzzy matching による主科目推定のローリング評価（件数・率のみ表示）。"""
+    office_code = settings.require_office_code()
+    masters = _run_or_latest(settings, office_code, "masters", None)
+    jrun = _run_or_latest(settings, office_code, "journals", None)
+    trun = _run_or_latest(settings, office_code, "transactions", None)
+    terms = load_json(masters / "term_settings.json").get("term_settings") or []
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    rows, _ = phase2.build_labels(_load_records(jrun, "journals"), _load_records(trun, "transactions"), terms, connected)
+    rows = [r for r in rows if r["fiscal_year"] is not None and 2018 <= r["fiscal_year"] <= 2024]
+    out = processed_dir(settings.data_dir, office_code) / "phase3"
+    fys = (2022, 2023, 2024)
+    thresholds = (95, 90, 85, 80, 75, 70)
+    report: dict = {}
+
+    preds = {(m, fy): phase3.rolling_predictions(rows, fy, m, "ratio") for m in phase3.NORMALIZERS for fy in fys}
+
+    # 2. raw exact vs normalized exact
+    print("## 2. raw exact vs normalized exact（ローリング, 主科目）")
+    print("| 正規化 | " + " | ".join(f"FY{fy} exact計 coverage / accuracy（うち正規化で追加 件数 / accuracy）" for fy in fys) + " |")
+    print("|---|" + "---:|" * len(fys))
+    for m in phase3.NORMALIZERS:
+        cells = []
+        for fy in fys:
+            s = phase3.stage_summary(phase3.apply_threshold(preds[(m, fy)], None))
+            report[f"exact:{m}:{fy}"] = s
+            add = s["norm_exact"]
+            cells.append(f"{_pct(s['total']['coverage'])} / {_pct(s['total']['accuracy'])}（+{add['n']} / {_pct(add['accuracy'])}）")
+        print(f"| {m} | " + " | ".join(cells) + " |")
+
+    # 3. fuzzy: 閾値比較（追加分のみ）
+    print("\n## 3. fuzzy matching（ratio）で新たに推定できた件数 / accuracy — 閾値別")
+    for fy in fys:
+        print(f"\nFY{fy}")
+        print("| 正規化 | " + " | ".join(f"≥{t}" for t in thresholds) + " |")
+        print("|---|" + "---:|" * len(thresholds))
+        for m in phase3.NORMALIZERS:
+            cells = []
+            for t in thresholds:
+                s = phase3.stage_summary(phase3.apply_threshold(preds[(m, fy)], t))
+                report[f"fuzzy:{m}:{fy}:{t}"] = s
+                cells.append(f"+{s['fuzzy']['n']} / {_pct(s['fuzzy']['accuracy'])}")
+            print(f"| {m} | " + " | ".join(cells) + " |")
+
+    # 正規化方式の選択: FY2022+FY2023 で ≥90 までの正解件数が最大のもの（FY2024 は見ない）
+    def correct(m, fy, t):
+        return phase3.stage_summary(phase3.apply_threshold(preds[(m, fy)], t))["total"]["correct"]
+    best = max(phase3.NORMALIZERS, key=lambda m: sum(correct(m, fy, 90) for fy in (2022, 2023)))
+    print(f"\n選択した正規化（FY2022+FY2023 の正解件数で選択）: {best}")
+    wr = {fy: phase3.rolling_predictions(rows, fy, best, "WRatio") for fy in fys}
+    print("\nscorer 比較（同じ正規化, fuzzy 追加分 件数 / accuracy）")
+    print("| scorer | " + " | ".join(f"FY{fy} ≥90 / ≥80" for fy in fys) + " |")
+    print("|---|" + "---:|" * len(fys))
+    for name, pr in (("ratio", {fy: preds[(best, fy)] for fy in fys}), ("WRatio", wr)):
+        cells = []
+        for fy in fys:
+            a, b = (phase3.stage_summary(phase3.apply_threshold(pr[fy], t))["fuzzy"] for t in (90, 80))
+            cells.append(f"+{a['n']} / {_pct(a['accuracy'])} ・ +{b['n']} / {_pct(b['accuracy'])}")
+        print(f"| {name} | " + " | ".join(cells) + " |")
+
+    # 5/6. 段階別（選択した正規化, ratio）
+    for t in (90, 80):
+        print(f"\n## 5/6. 段階別の内訳（{best}, fuzzy ≥{t}）")
+        print("| 年度 | 段階 | 件数（比率） | 主科目 accuracy | simple accuracy (件数) | complex accuracy (件数) |")
+        print("|---|---|---:|---:|---:|---:|")
+        for fy in fys:
+            s = phase3.stage_summary(phase3.apply_threshold(preds[(best, fy)], t))
+            for st, title in (("raw_exact", "exact raw"), ("norm_exact", "normalized exactで追加"), ("fuzzy", "fuzzyで追加"), ("none", "候補なし")):
+                v = s[st]
+                print(f"| FY{fy} | {title} | {v['n']} ({_pct(v['share'])}) | {_pct(v['accuracy'])} | "
+                      + (f"{_pct(v['simple_acc'])} ({v['simple_n']}) | {_pct(v['complex_acc'])} ({v['complex_n']})" if st != "none" else f"- ({v['simple_n']}) | - ({v['complex_n']})") + " |")
+
+    # 7. confidence 特徴（fuzzy は閾値なし＝全候補）
+    pooled = [p for fy in fys for p in preds[(best, fy)]]
+    fy24 = preds[(best, 2024)]
+    def sb(p):
+        if p["stage"] in ("raw_exact", "norm_exact"):
+            return p["stage"]
+        s = p["score"]
+        return "fuzzy 95-99" if s >= 95 else "fuzzy 90-94" if s >= 90 else "fuzzy 85-89" if s >= 85 else "fuzzy 80-84" if s >= 80 else "fuzzy 70-79" if s >= 70 else "fuzzy <70"
+    feats = [
+        ("段階・類似度", sb, ["raw_exact", "norm_exact", "fuzzy 95-99", "fuzzy 90-94", "fuzzy 85-89", "fuzzy 80-84", "fuzzy 70-79", "fuzzy <70"]),
+        ("過去出現回数", lambda p: "1" if p["hist_n"] == 1 else "2" if p["hist_n"] == 2 else "3-4" if p["hist_n"] < 5 else "5-9" if p["hist_n"] < 10 else "10+", ["1", "2", "3-4", "5-9", "10+"]),
+        ("過去の主科目一致率", lambda p: "100%" if p["hist_agreement"] == 1 else "80-99%" if p["hist_agreement"] >= 0.8 else "<80%", ["100%", "80-99%", "<80%"]),
+        ("top3候補の主科目一致（fuzzyのみ）", lambda p: ("一致" if p["top3_agree"] else "不一致") if p["stage"] == "fuzzy" else "exact", ["一致", "不一致", "exact"]),
+        ("最終利用からの日数", lambda p: "≤31" if p["days_since_last"] <= 31 else "32-90" if p["days_since_last"] <= 90 else "91-365" if p["days_since_last"] <= 365 else ">365", ["≤31", "32-90", "91-365", ">365"]),
+        ("simple/complex 履歴", lambda p: p["hist_complex"], ["simple", "mixed", "complex"]),
+    ]
+    print(f"\n## 7. confidence 特徴と主科目 accuracy（{best}, fuzzy は閾値なしの全候補）")
+    print("| 特徴 | 値 | FY2022-24 件数 / accuracy | FY2024 件数 / accuracy |")
+    print("|---|---|---:|---:|")
+    for title, key, order in feats:
+        a = {k: (n, acc) for k, n, acc in phase3.bucket_accuracy(pooled, key, order)}
+        b = {k: (n, acc) for k, n, acc in phase3.bucket_accuracy(fy24, key, order)}
+        for k in order:
+            if k in a or k in b:
+                print(f"| {title} | {k} | {a.get(k, (0, None))[0]} / {_pct(a.get(k, (0, None))[1])} | {b.get(k, (0, None))[0]} / {_pct(b.get(k, (0, None))[1])} |")
+
+    combos = [
+        ("exact・過去3回以上・一致率100%", lambda p: p["stage"] in ("raw_exact", "norm_exact") and p["hist_n"] >= 3 and p["hist_agreement"] == 1),
+        ("exact・過去3回以上・一致率100%・365日以内", lambda p: p["stage"] in ("raw_exact", "norm_exact") and p["hist_n"] >= 3 and p["hist_agreement"] == 1 and p["days_since_last"] <= 365),
+        ("exact・過去2回以上・一致率100%・simple履歴", lambda p: p["stage"] in ("raw_exact", "norm_exact") and p["hist_n"] >= 2 and p["hist_agreement"] == 1 and p["hist_complex"] == "simple"),
+        ("exact・一致率≥80%", lambda p: p["stage"] in ("raw_exact", "norm_exact") and p["hist_agreement"] >= 0.8),
+        ("fuzzy≥90・top3一致・一致率100%", lambda p: p["stage"] == "fuzzy" and p["score"] >= 90 and p["top3_agree"] and p["hist_agreement"] == 1),
+        ("fuzzy≥85・top3一致", lambda p: p["stage"] == "fuzzy" and p["score"] >= 85 and p["top3_agree"]),
+        ("fuzzy≥80・top3一致・一致率100%", lambda p: p["stage"] == "fuzzy" and p["score"] >= 80 and p["top3_agree"] and p["hist_agreement"] == 1),
+    ]
+    print("\n### 特徴の組み合わせ（主科目 accuracy）")
+    print("| 条件 | " + " | ".join(f"FY{fy} 件数（全体比）/ accuracy" for fy in fys) + " |")
+    print("|---|" + "---:|" * len(fys))
+    for title, f in combos:
+        cells = []
+        for fy in fys:
+            ps = [p for p in preds[(best, fy)] if p["stage"] != "none" and f(p)]
+            ok = sum(1 for p in ps if p["correct"])
+            cells.append(f"{len(ps)} ({_pct(len(ps) / len(preds[(best, fy)]))}) / {_pct(ok / len(ps) if ps else None)}")
+        print(f"| {title} | " + " | ".join(cells) + " |")
+
+    # 8. FY2024 比較
+    print(f"\n## 8. FY2024 比較（主科目, {best}）")
+    print("| 段階 | coverage | 主科目 accuracy | 正解件数 / 評価対象 |")
+    print("|---|---:|---:|---:|")
+    rawp = phase3.apply_threshold([p if p["stage"] != "norm_exact" else {**p, "stage": "none", "pred": None, "correct": None} for p in preds[(best, 2024)]], None)
+    for title, ps in (("A. raw exact のみ", rawp), ("B. normalized exact まで", phase3.apply_threshold(preds[(best, 2024)], None)),
+                      *((f"C. fuzzy ≥{t} まで", phase3.apply_threshold(preds[(best, 2024)], t)) for t in (90, 85, 80, 70))):
+        s = phase3.stage_summary(ps)["total"]
+        print(f"| {title} | {_pct(s['coverage'])} | {_pct(s['accuracy'])} | {s['correct']} / {len(ps)} |")
+
+    for fy in fys:
+        write_csv(out / f"predictions_fy{fy}.csv", preds[(best, fy)])
+    save_json(out / "phase3_report.json", {"normalizer": best, **report})
+    print(f"\n派生データ: {out}")
+
+
 # ---- entry ------------------------------------------------------------------
 
 
@@ -665,6 +799,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--target-fy", type=int, default=2024)
     sp.add_argument("--eval-fy", type=int, nargs="+", default=[2024, 2023, 2022])
     sp.set_defaults(func=cmd_analyze25)
+
+    sp = sub.add_parser("analyze3", help="Phase 3: 正規化 + fuzzy matching による主科目推定の評価（値は表示しない）")
+    sp.set_defaults(func=cmd_analyze3)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")

@@ -7,7 +7,7 @@ name = "mf-ai-accounting"
 version = "0.1.0"
 description = "Money Forward Cloud Accounting read-only data fetcher (Phase 1)"
 requires-python = ">=3.11"
-dependencies = ["requests>=2.32,<3", "python-dotenv>=1.0,<2"]
+dependencies = ["requests>=2.32,<3", "python-dotenv>=1.0,<2", "rapidfuzz>=3,<4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
