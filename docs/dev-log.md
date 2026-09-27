@@ -31,4 +31,15 @@
 
 **コミット前の確認**: ダミーの `.env`・`data/` ファイル・JWT文字列を一時的にステージし、チェッカーがすべて検出して拒否することを確認してから削除した。
 
-**次**: `.env` に実際のAPIキーを設定 → Step 1（`offices`）
+### Step 1: 認証と accessible_offices（完了）
+
+- 初回は `/auth/exchange` が 401。原因は `.env.example` の `mf_api_prd_REPLACE_ME` の `REPLACE_ME` 部分だけを置き換えたため、先頭 `mf_api_prd_` が重複していたこと
+- 実際のキーは `mf_api_pro_` で始まり、ハイフンを含む（公式サンプルの `mf_api_prd_` + 英数字32文字とは異なる）
+- 対策:
+  - `.env.example` を `MF_API_KEY=REPLACE_WITH_YOUR_API_KEY`（右辺全体を置き換える形式）に変更
+  - `config.py` で先頭重複・`mf_api_` 以外の形式・ダミー値を検出してエラーにする
+  - `check_secrets.py` のAPIキー検出パターンをハイフン・`pro` 等を含む形式に拡張
+- 修正後、JWT取得に成功（有効期限3600秒）。アクセス可能な事業者は1件（法人、会計期間9期分）
+- 取得結果は `data/raw/_all/accessible_offices/`（Git管理外）
+
+**次**: `.env` に `MF_OFFICE_CODE` を設定 → Step 2（`masters`）

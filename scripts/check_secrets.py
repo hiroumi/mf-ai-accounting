@@ -6,7 +6,7 @@
 
 検査内容:
   - 禁止パス: .env（.env.example 以外）, data/ 配下（.gitkeep 以外）, *.pem, *.key
-  - APIキー形式（mf_api_prd_...）、JWT形式（eyJ...）
+  - APIキー形式（mf_api_xxx_...）、JWT形式（eyJ...）
   - ローカル .env に設定された実際の MF_API_KEY / MF_OFFICE_CODE の値そのもの
 """
 
@@ -23,7 +23,7 @@ FORBIDDEN_PATH = [
     re.compile(r"\.(pem|key)$"),
 ]
 SECRET_PATTERNS = {
-    "APIキー": re.compile(r"mf_api_(prd|stg|dev)_(?!REPLACE_ME)[A-Za-z0-9]{8,}"),
+    "APIキー": re.compile(r"mf_api_[a-z]{2,5}_[A-Za-z0-9_-]{16,}"),
     "JWT": re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
 }
 # ドキュメント中の公式サンプル値は除外
@@ -42,7 +42,7 @@ def local_env_values() -> dict[str, str]:
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 v = v.strip().strip('"').strip("'")
-                if k.strip() in ("MF_API_KEY", "MF_OFFICE_CODE") and v and "REPLACE_ME" not in v and v != "0000-0000":
+                if k.strip() in ("MF_API_KEY", "MF_OFFICE_CODE") and v and "REPLACE" not in v and v != "0000-0000":
                     values[k.strip()] = v
     return values
 

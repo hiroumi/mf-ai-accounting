@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 OFFICE_CODE_RE = re.compile(r"^[0-9A-Za-z]{4}-[0-9A-Za-z]{4}$")
-DUMMY_MARKERS = ("REPLACE_ME", "xxxx", "XXXX-XXXX", "0000-0000")
+DUMMY_OFFICE_CODES = ("XXXX-XXXX", "0000-0000")
 
 
 class ConfigError(RuntimeError):
@@ -63,12 +63,16 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
     api_key = os.getenv("MF_API_KEY", "").strip()
     if not api_key:
         raise ConfigError("MF_API_KEY が未設定です。.env.example を .env にコピーしてAPIキーを設定してください。")
-    if any(m in api_key for m in DUMMY_MARKERS):
+    if "REPLACE" in api_key or api_key.startswith("mf_api_prd_xxxx"):
         raise ConfigError("MF_API_KEY がダミー値のままです。.env に実際のAPIキーを設定してください。")
+    if api_key.count("mf_api_") > 1:
+        raise ConfigError("MF_API_KEY の先頭 'mf_api_' が重複しています。発行されたキーそのものだけを設定してください。")
+    if not api_key.startswith("mf_api_"):
+        raise ConfigError("MF_API_KEY は 'mf_api_' で始まるAPIキーを設定してください。")
 
     office_code = os.getenv("MF_OFFICE_CODE", "").strip() or None
     if office_code is not None:
-        if office_code in DUMMY_MARKERS:
+        if office_code in DUMMY_OFFICE_CODES:
             office_code = None
         elif not OFFICE_CODE_RE.match(office_code):
             raise ConfigError(f"MF_OFFICE_CODE は XXXX-XXXX 形式で指定してください: {office_code!r}")
