@@ -45,6 +45,7 @@ MF_JOURNALS_START_DATE=2018-08-01 MF_JOURNALS_END_DATE=2025-07-31 mf transaction
 mf csv
 mf report                        # 年度別の品質集計（値は表示しない）
 mf analyze                       # Phase 2準備: 過去データのみでの相手科目推定の評価（exact content）
+mf analyze25                     # Phase 2.5: 直近重視・年度重み・方針変更検知・高信頼条件の比較
 ```
 
 `--start YYYY-MM-DD --end YYYY-MM-DD` で少量取得の期間を指定できます。

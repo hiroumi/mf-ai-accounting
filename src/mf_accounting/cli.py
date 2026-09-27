@@ -21,7 +21,7 @@ from .client import MFAccountingClient, MFApiError
 from .config import ConfigError, Settings, load_settings
 from .guard import ForbiddenRequestError, GuardedSession
 from .inspect_json import format_summary, summarize, value_counts
-from . import phase2
+from . import phase2, phase25
 from .quality import format_report, quality_report
 from .validate import DataValidationError, validate_journals, validate_transactions
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
@@ -494,6 +494,124 @@ def cmd_analyze(settings: Settings, args) -> None:
     print(f"\n派生データ: {out}（counter_labels.csv, bank_account_map.csv, content_stats.csv, phase2_report.json）")
 
 
+def cmd_analyze25(settings: Settings, args) -> None:
+    """Phase 2.5: 直近重視・年度重み・記帳方針変更検知の比較（件数・率のみ表示）。"""
+    from collections import Counter
+
+    office_code = settings.require_office_code()
+    masters = _run_or_latest(settings, office_code, "masters", None)
+    jrun = _run_or_latest(settings, office_code, "journals", None)
+    trun = _run_or_latest(settings, office_code, "transactions", None)
+    terms = load_json(masters / "term_settings.json").get("term_settings") or []
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    rows, _ = phase2.build_labels(_load_records(jrun, "journals"), _load_records(trun, "transactions"), terms, connected)
+    rows = [r for r in rows if r["fiscal_year"] is not None and 2018 <= r["fiscal_year"] <= 2024]
+    out = processed_dir(settings.data_dir, office_code) / "phase25"
+    target = args.target_fy
+    hist = phase25.histories(rows, target)
+    report: dict = {"target_fy": target}
+
+    # 1. Recent-window
+    wins = [("全期間", None), ("直近10件", 10), ("直近5件", 5), ("直近3件", 3), ("直近2件", 2)]
+    wrows = []
+    for content, o in hist.items():
+        row = {"content": content, "n": len(o)}
+        for name, k in wins:
+            st = phase25.window_stats(o, k)
+            row.update({f"{name}_mode": st["mode"], f"{name}_agreement": round(st["agreement"], 4), f"{name}_changed": st["changed_in_window"]})
+        row["last_date"] = o[-1].date
+        wrows.append(row)
+    write_csv(out / f"content_windows_before_fy{target}.csv", wrows)
+    multi = [r for r in wrows if r["n"] >= 2]
+    print(f"## 1. Recent-window（FY{target}評価時点 = FY{target - 1}末までの履歴, 2回以上出現 {len(multi)}種類）")
+    print("| 窓 | 平均一致率 | 一致率100%の種類 | 窓内で科目変更あり | 最頻が全期間の最頻と異なる |")
+    print("|---|---:|---:|---:|---:|")
+    for name, _ in wins:
+        avg = sum(r[f"{name}_agreement"] for r in multi) / len(multi)
+        print(f"| {name} | {_pct(avg)} | {sum(1 for r in multi if r[f'{name}_agreement'] == 1)} | {sum(1 for r in multi if r[f'{name}_changed'])} | {sum(1 for r in multi if r[f'{name}_mode'] != r['全期間_mode'])} |")
+    last_fy = Counter(o[-1].fy for o in hist.values())
+    print("最終利用年度の分布（全content）: " + ", ".join(f"FY{k}={v}" for k, v in sorted(last_fy.items())))
+
+    # 3. 記帳方針変更の検知
+    test = [r for r in rows if r["fiscal_year"] == target and r.get("label_account") and r.get("tx_content")]
+    print(f"\n## 3. 記帳方針変更の検知（FY{target - 1}末時点）")
+    report["change"] = {}
+    for m in (2, 3):
+        ch = {c: phase25.detect_change(o, m) for c, o in hist.items()}
+        det = {c for c, v in ch.items() if v["change_detected"]}
+        trows = [r for r in test if r["tx_content"] in det]
+        cur_ok = sum(1 for r in trows if ch[r["tx_content"]]["current_account"] == r["label_account"])
+        prev_ok = sum(1 for r in trows if ch[r["tx_content"]]["previous_mode"] == r["label_account"])
+        mode_ok = sum(1 for r in trows if phase25.mode(hist[r["tx_content"]])[0] == r["label_account"])
+        since = Counter(min(ch[c]["observations_since_change"], 5) for c in det)
+        print(f"連続{m}件以上で変更検知: {len(det)}/{sum(1 for o in hist.values() if len(o) >= m + 1)}種類。FY{target}の該当明細 {len(trows)}件で "
+              f"変更後の科目が正解 {cur_ok} ({_pct(cur_ok / len(trows) if trows else None)}) / 変更前の最頻が正解 {prev_ok} / 全期間最頻が正解 {mode_ok}。"
+              f"変更後の連続件数: {dict(sorted(since.items()))}（5=5件以上）")
+        report["change"][m] = {"detected": len(det), "test_rows": len(trows), "current_correct": cur_ok, "previous_correct": prev_ok, "mode_correct": mode_ok}
+        write_csv(out / f"content_changes_min{m}_before_fy{target}.csv", [{"content": c, **v} for c, v in ch.items()])
+    # FY2024 で新たに起きた変更（評価年度内の出現で最頻が過去と変わった）
+    new_change = 0
+    for c, o in hist.items():
+        now = [r["label_account"] for r in test if r["tx_content"] == c]
+        if now and Counter(now).most_common(1)[0][0] != phase25.mode(o)[0]:
+            new_change += 1
+    print(f"FY{target}中に最頻科目が過去の最頻から変わった content: {new_change}種類（評価時点では未検知の変更）")
+
+    # 4. simple / complex
+    shift = phase25.structure_shift(rows, target)
+    print(f"\n## 4. 構造の変化（過去 → FY{target}, 過去に同一contentありの明細）")
+    print("明細: " + ", ".join(f"{k}={v}" for k, v in sorted(shift["rows"].items())) + " / content種類: " + ", ".join(f"{k}={v}" for k, v in sorted(shift["contents"].items())))
+    report["structure_shift"] = shift
+
+    # 5. 方式比較（年度単位 = 主評価 / ローリング = 実運用に近い補助評価）
+    fys = sorted(set(args.eval_fy) | {2022, 2023, 2024})
+    pairs = {(mode_, fy): (phase25.year_block_pairs if mode_ == "year" else phase25.rolling_pairs)(rows, fy) for mode_ in ("year", "rolling") for fy in fys}
+    mode_title = {"year": "年度単位（教師: 評価年度より前の年度）", "rolling": "ローリング（各明細の取引日より前の全データ）"}
+    report["compare"] = {}
+    for mode_ in ("year", "rolling"):
+        cmp = {fy: phase25.compare_methods(pairs[(mode_, fy)], fy) for fy in fys}
+        report["compare"][mode_] = cmp
+        v24 = cmp[target]
+        print(f"\n## 5. 方式比較 FY{target} — {mode_title[mode_]}")
+        print("| 方式 | coverage | accuracy | simple accuracy (件数) | complex accuracy (件数) | 参考: FY2023 / FY2022 accuracy |")
+        print("|---|---:|---:|---:|---:|---:|")
+        for name, v in v24.items():
+            print(f"| {name} | {v['covered']}/{v['test']} ({_pct(v['coverage'])}) | {_pct(v['accuracy'])} | {_pct(v['simple_accuracy'])} ({v['simple_n']}) | "
+                  f"{_pct(v['complex_accuracy'])} ({v['complex_n']}) | {_pct(cmp[2023][name]['accuracy'])} / {_pct(cmp[2022][name]['accuracy'])} |")
+
+    # 6. High-confidence 条件
+    grid = phase25.rule_grid()
+    report["rules"] = {}
+    for mode_ in ("year", "rolling"):
+        res = {r: {fy: phase25.evaluate_rule(r, pairs[(mode_, fy)], fy) for fy in (2022, 2023, 2024)} for r in grid}
+        report["rules"][mode_] = [{"rule": r.name(), **{str(fy): res[r][fy] for fy in (2022, 2023, 2024)}} for r in grid]
+        def row(r, res=res):
+            v = res[r]
+            return f"| {r.name()} | " + " | ".join(f"{v[fy]['coverage'] * 100:.1f}% / {_pct(v[fy]['accuracy'])} ({v[fy]['n']})" for fy in (2022, 2023, 2024)) + " |"
+        hdr = "| 条件 | FY2022 coverage / accuracy (件数) | FY2023 | FY2024 |\n|---|---:|---:|---:|"
+        print(f"\n## 6. High-confidence 条件 — {mode_title[mode_]}（{len(grid)}通り）")
+        print("\n### 代表的な条件")
+        print(hdr)
+        for r in [phase25.Rule(10, 10, "any", False, True), phase25.Rule(5, 5, "any", False, True), phase25.Rule(3, 3, "any", False, True),
+                  phase25.Rule(2, 2, "any", False, False), phase25.Rule(3, 3, "any", False, False), phase25.Rule(5, 5, "any", False, False),
+                  phase25.Rule(3, 3, "prev_fy", True, False), phase25.Rule(5, 5, "prev_fy", True, False), phase25.Rule(5, 10, "prev_fy", True, True)]:
+            print(row(r))
+        ok = lambda v, a=0.98: v["accuracy"] is not None and v["accuracy"] >= a and v["n"] >= 20
+        fair = sorted([r for r in grid if ok(res[r][2022]) and ok(res[r][2023])], key=lambda r: -(res[r][2022]["coverage"] + res[r][2023]["coverage"]))
+        print("\n### FY2022・FY2023 の両方で accuracy 98%以上（各20件以上）→ coverage 上位を FY2024 に適用（公正な評価）")
+        print(hdr)
+        for r in fair[:6]:
+            print(row(r))
+        if not fair:
+            print("| 該当なし | | | |")
+        print("\n### 参考: FY2024 の accuracy 下限ごとの最大 coverage（FY2024を見て選んだ楽観値）")
+        for a in (0.95, 0.97, 0.98, 0.99):
+            best = max((r for r in grid if ok(res[r][2024], a)), key=lambda r: res[r][2024]["coverage"], default=None)
+            print(f"- accuracy ≥{a * 100:.0f}%: " + (f"coverage {res[best][2024]['coverage'] * 100:.1f}%（{res[best][2024]['n']}件, 実accuracy {_pct(res[best][2024]['accuracy'])}）: {best.name()}" if best else "該当なし"))
+    save_json(out / "phase25_report.json", report)
+    print(f"\n派生データ: {out}")
+
+
 # ---- entry ------------------------------------------------------------------
 
 
@@ -542,6 +660,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--journals-run")
     sp.add_argument("--transactions-run")
     sp.set_defaults(func=cmd_analyze)
+
+    sp = sub.add_parser("analyze25", help="Phase 2.5: 直近重視・年度重み・方針変更検知の比較（値は表示しない）")
+    sp.add_argument("--target-fy", type=int, default=2024)
+    sp.add_argument("--eval-fy", type=int, nargs="+", default=[2024, 2023, 2022])
+    sp.set_defaults(func=cmd_analyze25)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
