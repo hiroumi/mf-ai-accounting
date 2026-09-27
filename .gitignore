@@ -1,0 +1,27 @@
+# 認証情報（絶対にコミットしない）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 取得した会計データ（社外秘）
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
