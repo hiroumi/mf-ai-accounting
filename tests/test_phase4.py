@@ -114,3 +114,34 @@ def test_model_options_haiku_has_no_adaptive_thinking():
     assert phase4.model_options("claude-opus-5")["thinking"] is True
     req = phase4._request_for("claude-haiku-4-5", "s", {"type": "object"}, "u", None, False)
     assert "thinking" not in req and req["output_config"] == {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+
+
+def test_reason_category_schema_and_prompt():
+    cat = _cat()
+    s = phase4.output_schema(cat, with_reason_category=True)
+    assert s["properties"]["reason_category"]["enum"] == phase4.REASON_CATEGORY_ENUM
+    assert "reason_category" in s["required"]
+    assert "reason_category" not in phase4.output_schema(cat)["properties"]
+    assert "reason_category" in phase4.system_text(cat, True) and "reason_category" not in phase4.system_text(cat, False)
+
+
+def test_non_high_conf_exact_gets_e_category():
+    e = phase4.classify_target(pred("raw_exact", n=2))
+    assert e["categories"] == ["E_exact過去1〜2回"] and not e["llm_target"] and not e["high_confidence"]
+
+
+def test_run_llm_stops_when_cost_exceeds_limit(monkeypatch):
+    class FakeClient:
+        class messages:
+            @staticmethod
+            def create(**kw):
+                r = _Resp('{"primary_account_code":"A001","confidence":0.8,"reason":"r","needs_review":false,"insufficient_information":false}')
+                r.model = kw["model"]
+                r.usage = type("U", (), {"input_tokens": 1_000_000, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})()
+                return r
+    monkeypatch.setattr(phase4, "make_client", lambda max_retries=0: FakeClient())
+    done = []
+    with pytest.raises(phase4.LLMRunError):
+        phase4.run_llm([{"transaction_id": str(i), "user_text": "u"} for i in range(5)], "s", {}, _cat(), "claude-sonnet-5", "medium",
+                       approved=True, on_result=done.append, max_cost=3.0)
+    assert len(done) == 2  # $2/件 → 2件目で$4 > $3 で停止

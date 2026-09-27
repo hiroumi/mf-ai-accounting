@@ -789,20 +789,30 @@ def cmd_llm_prepare(settings: Settings, args) -> None:
     high = [t for t in enriched if t["high_confidence"]]
     targets = [t for t in enriched if t["llm_target"]]
     other = [t for t in enriched if not t["high_confidence"] and not t["llm_target"]]
+    if args.all:  # 実運用パイプライン: 高confidence群以外はすべて LLM へ
+        targets = [t for t in enriched if not t["high_confidence"]]
     cat_counts = Counter(c for t in targets for c in t["categories"])
     unreachable = sum(1 for t in targets if t["actual"] not in catalog.id_to_code)
 
     print(f"## 1. FY{target_fy} の対象選定（{len(enriched)}件）")
     print(f"- 高confidence群（LLM対象外）: {len(high)}件 — exact・過去3回以上・主科目一致率100%・最終利用365日以内")
     print(f"- LLM対象: {len(targets)}件（カテゴリ重複あり）: " + ", ".join(f"{k}={v}" for k, v in sorted(cat_counts.items())))
-    print(f"- その他（exact・過去1〜2回で一致、LLM対象外・ルールで推定）: {len(other)}件")
+    print(f"- その他（E: exact・過去1〜2回で一致）: {len(other)}件" + ("（--all のため LLM対象に含める）" if args.all else "（LLM対象外・ルールで推定）"))
+    sig = Counter("+".join(c[0] for c in t["categories"]) for t in targets)
+    print("- 条件の組み合わせ（重複を考慮）: " + ", ".join(f"{k}={v}" for k, v in sorted(sig.items())))
     print(f"- LLM対象のうち、正解の主科目が現在利用不可（選択肢にない）: {unreachable}件")
 
-    sample = phase4.stratified_sample(targets, args.sample)
+    sample = sorted(targets, key=lambda t: (t["tx_date"], t["transaction_id"])) if args.all else phase4.stratified_sample(targets, args.sample)
     ordered = phase4.build_candidate_index(rows)
-    system = phase4.system_text(catalog)
-    schema = phase4.output_schema(catalog)
-    dry = out / "dry_run"
+    system = phase4.system_text(catalog, args.reason_category)
+    schema = phase4.output_schema(catalog, args.reason_category)
+    dry = out / args.name
+    dry.mkdir(parents=True, exist_ok=True)
+    # パイプライン評価用: 全明細のルール判定（正解を含むため送信しない）
+    save_json(dry / "pipeline_rules_not_sent.json", [
+        {"transaction_id": t["transaction_id"], "high_confidence": t["high_confidence"], "sent_to_llm": t in targets,
+         "categories": t["categories"], "rule_stage": t["stage"], "rule_pred": t["pred"], "actual": t["actual"], "actual_complex": t["actual_complex"]}
+        for t in enriched])
     items, answers = [], []
     for t in sample:
         cands = phase4.candidates_before(ordered, t["tx_date"], t["tx_content"], catalog.id_to_code, names)
@@ -826,9 +836,9 @@ def cmd_llm_prepare(settings: Settings, args) -> None:
         "電話番号": len(phase4._PHONE.findall(blob)),
         "正解の仕訳ID/明細ID": sum(1 for i, a in zip(items, answers) if a["transaction_id"] in i["user_text"]),
     }
-    sc = Counter((("B" if "B_fuzzy候補のみ" in t["categories"] else "A" if "A_候補なし" in t["categories"] else "C" if "C_科目が割れている" in t["categories"] else "D"), "complex" if t["actual_complex"] else "simple") for t in sample)
+    sc = Counter((("B" if "B_fuzzy候補のみ" in t["categories"] else "A" if "A_候補なし" in t["categories"] else "C" if "C_科目が割れている" in t["categories"] else "D" if "D_365日以上未使用" in t["categories"] else "E"), "complex" if t["actual_complex"] else "simple") for t in sample)
     ncand = Counter(len(i["payload"]["past_similar_transactions"]) for i in items)
-    print(f"\n## 2. dry-run サンプル {len(sample)}件（層別抽出, seed固定）")
+    print(f"\n## 2. payload {len(sample)}件（{'全件' if args.all else '層別抽出, seed固定'}）")
     print("- 層（A=exactなし・候補なし（fuzzy<70含む）, B=exactなし・fuzzy候補(≥70)のみ, C=科目が割れている, D=長期未使用）×構造: " + ", ".join(f"{k[0]}/{k[1]}={v}" for k, v in sorted(sc.items())))
     print(f"- 過去候補の件数分布: {dict(sorted(ncand.items()))}（最大 {phase4.MAX_CANDIDATES}件）")
     print(f"- 選択可能な勘定科目: {len(catalog.rows)}（現在利用可能なもの, 短縮コード A001〜 → ローカルでMFのIDに変換）")
@@ -855,13 +865,23 @@ def cmd_llm_prepare(settings: Settings, args) -> None:
 
 def cmd_llm_run(settings: Settings, args) -> None:
     rows, accounts, out = _phase4_context(settings)
-    dry = out / "dry_run"
+    dry = out / args.name
     items = [json.loads(l) for l in (dry / "payloads.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
     catalog = phase4.Catalog.from_accounts(accounts, available_only=True)
     if load_json(dry / "catalog.json")["code_to_id"] != catalog.code_to_id:
         raise ConfigError("勘定科目カタログが dry-run 時と異なります。llm-prepare をやり直してください。")
     system = (dry / "system_prompt.txt").read_text(encoding="utf-8")
     schema = load_json(dry / "output_schema.json")
+
+    path = dry / f"results_{args.model}_{args.effort}.jsonl"
+    done_ids = set()
+    if args.resume and path.exists():
+        done_ids = {json.loads(l)["transaction_id"] for l in path.read_text(encoding="utf-8").splitlines() if l.strip()}
+        items = [i for i in items if i["transaction_id"] not in done_ids]
+        print(f"再開: 完了済み {len(done_ids)}件をスキップ、残り {len(items)}件")
+    if not items:
+        print("実行対象がありません。")
+        return
 
     # 1. 実際の入力トークン数
     est = [phase4.estimate_tokens(system) + phase4.estimate_tokens(json.dumps(schema)) + phase4.estimate_tokens(i["user_text"]) for i in items]
@@ -874,21 +894,39 @@ def cmd_llm_run(settings: Settings, args) -> None:
     print(f"count_tokens: 合計 {sum(counts):,} tokens（1件 平均 {sum(counts) // len(counts):,} / 最小 {min(counts):,} / 最大 {max(counts):,}）、ローカル概算 {sum(est):,}")
     if sum(counts) > 2 * sum(est):
         raise ConfigError("実際のトークン数が見積もりの2倍を超えたため、実行せずに停止しました。")
+    # キャッシュ対象（system + スキーマ）は全件共通。40件実行時の実績では cache_write = 共通部分
+    shared = phase4.shared_tokens(system, schema, args.model, args.effort, approved=args.approve)
+    n = len(counts)
+    uncached = sum(counts) - shared * n
+    pin, pout, pcache = phase4.PRICES[args.model]
+    exp_out = args.expected_output * n
+    cost_cached = (uncached * pin + shared * pin * 1.25 + shared * (n - 1) * pcache + exp_out * pout) / 1e6
+    cost_nocache = (sum(counts) * pin + exp_out * pout) / 1e6
+    print(f"キャッシュ対象 {shared:,} tokens/件 → cache write {shared:,} / cache read {shared * (n - 1):,} / uncached {uncached:,}")
+    print(f"想定 output {args.expected_output} tokens/件 × {n} = {exp_out:,}")
+    print(f"推定コスト: キャッシュあり ${cost_cached:.2f} / キャッシュなし ${cost_nocache:.2f}（上限 ${args.max_cost:.2f}）")
+    if cost_cached > args.max_cost:
+        raise ConfigError(f"推定コストが上限 ${args.max_cost:.2f} を超えるため、実行せずに停止しました。")
     if args.count_only:
         return
 
     # 2. 実行（1件ずつ保存。異常時は停止）
-    path = dry / f"results_{args.model}_{args.effort}.jsonl"
-    path.write_text("", encoding="utf-8")
+    if not args.resume:
+        path.write_text("", encoding="utf-8")
+    spent = 0.0
+    if args.resume and path.exists():
+        spent = sum(phase4.usage_cost(args.model, json.loads(l)["usage"]) for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
     def append(rec):
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     try:
-        results = phase4.run_llm(items, system, schema, catalog, args.model, args.effort, approved=args.approve, on_result=append)
+        results = phase4.run_llm(items, system, schema, catalog, args.model, args.effort, approved=args.approve, on_result=append,
+                                 max_cost=args.max_cost, spent=spent)
     except phase4.LLMRunError as e:
         done = sum(1 for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
-        print(f"[停止] {e}（{done}/{len(items)}件で停止。fallback はしていません）", file=sys.stderr)
+        print(f"[停止] {e}（累計 {done}件完了で停止。fallback はしていません。--resume で再開可能）", file=sys.stderr)
         raise SystemExit(5)
+    results = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     u = [r["usage"] for r in results]
     print(f"{len(results)}件 完了。usage 合計: input {sum(x['input'] for x in u):,} / cache_write {sum(x['cache_write'] for x in u):,} / "
           f"cache_read {sum(x['cache_read'] for x in u):,} / output {sum(x['output'] for x in u):,} tokens")
@@ -963,6 +1001,99 @@ def cmd_llm_compare(settings: Settings, args) -> None:
     print(f"- B: {B}>=0.70 のみ: {cov(lambda r: r['bc'] >= 0.7, lambda r: r['b_ok'])}")
     print(f"- C: {A}>=0.70 のみ: {cov(lambda r: r['ac'] >= 0.7, lambda r: r['a_ok'])}")
     save_json(dry / f"compare_{args.a_label}_vs_{args.b_label}.json", {"agreement": dict((f"{k[0]}_{k[1]}", v) for k, v in g.items()), "n": n})
+
+
+def cmd_llm_pipeline_eval(settings: Settings, args) -> None:
+    """FY2024 全件の実運用パイプライン評価（ルール → LLM → 人間確認）。件数・率のみ表示。"""
+    office_code = settings.require_office_code()
+    d = processed_dir(settings.data_dir, office_code) / "phase4" / args.name
+    rules = load_json(d / "pipeline_rules_not_sent.json")
+    res = {r["transaction_id"]: r for r in (json.loads(l) for l in (d / args.results).read_text(encoding="utf-8").splitlines() if l.strip())}
+    N = len(rules)
+    rows = []
+    for r in rules:
+        o = (res.get(r["transaction_id"]) or {}).get("output") or {}
+        rows.append({**r, "llm": o.get("primary_account_id"), "conf": o.get("confidence"), "nr": o.get("needs_review"),
+                     "insuff": o.get("insufficient_information"), "rcat": o.get("reason_category"), "has_llm": bool(o)})
+    for r in rows:
+        r["rule_ok"] = r["rule_pred"] is not None and r["rule_pred"] == r["actual"]
+        r["llm_ok"] = r["llm"] is not None and r["llm"] == r["actual"]
+        # ルールのみの予測: A 層は有効な候補なし（fuzzy<70 or 候補なし）
+        r["rule_only_ok"] = r["rule_ok"] and "A_候補なし" not in r["categories"]
+    high = [r for r in rows if r["high_confidence"]]
+    llm = [r for r in rows if r["sent_to_llm"]]
+    missing = [r for r in llm if not r["has_llm"]]
+    pct = lambda a, b: _pct(a / b if b else None)
+    acc = lambda rs, k="llm_ok": f"{sum(r[k] for r in rs)}/{len(rs)} ({pct(sum(r[k] for r in rs), len(rs))})"
+    print(f"FY2024: {N}件 = 高confidenceルール {len(high)} + LLM対象 {len(llm)}（うち結果なし {len(missing)}）\n")
+
+    print("## 5. Sonnet 単体（LLM対象）")
+    print(f"- accuracy: {acc(llm)} / 参考: 同じ明細でルールのみ {acc(llm, 'rule_only_ok')}")
+    print("| 条件（その条件を持つ明細, 重複あり） | 件数 | Sonnet accuracy | ルールのみ accuracy |\n|---|---:|---:|---:|")
+    for c in ("A_候補なし", "B_fuzzy候補のみ", "C_科目が割れている", "D_365日以上未使用", "E_exact過去1〜2回"):
+        rs = [r for r in llm if c in r["categories"]]
+        print(f"| {c} | {len(rs)} | {acc(rs)} | {acc(rs, 'rule_only_ok')} |")
+    print("| 条件の組み合わせ（重複なし） | 件数 | Sonnet accuracy | ルールのみ accuracy |\n|---|---:|---:|---:|")
+    for sig in sorted({"+".join(c[0] for c in r["categories"]) for r in llm}):
+        rs = [r for r in llm if "+".join(c[0] for c in r["categories"]) == sig]
+        print(f"| {sig} | {len(rs)} | {acc(rs)} | {acc(rs, 'rule_only_ok')} |")
+    for label, rs in (("simple", [r for r in llm if not r["actual_complex"]]), ("complex", [r for r in llm if r["actual_complex"]])):
+        print(f"- {label}: {acc(rs)}")
+
+    print("\n## 6. confidence calibration（LLM対象 {} 件）".format(len(llm)))
+    print("| 条件 | 件数 | coverage | accuracy | 誤り |\n|---|---:|---:|---:|---:|")
+    def cal(label, sel):
+        rs = [r for r in llm if r["has_llm"] and sel(r)]
+        ok = sum(r["llm_ok"] for r in rs)
+        print(f"| {label} | {len(rs)} | {pct(len(rs), len(llm))} | {pct(ok, len(rs))} | {len(rs) - ok} |")
+    for t in (0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95):
+        cal(f"confidence >= {t:.2f}", lambda r, t=t: r["conf"] >= t)
+    cal("needs_review = false", lambda r: r["nr"] is False)
+    cal("confidence >= 0.70 AND needs_review = false", lambda r: r["conf"] >= 0.7 and r["nr"] is False)
+
+    def simulate(t, require_nr_false, exclude_insuff):
+        auto_llm = [r for r in llm if r["has_llm"] and r["llm"] and r["conf"] >= t and (not require_nr_false or r["nr"] is False) and (not exclude_insuff or not r["insuff"])]
+        auto = len(high) + len(auto_llm)
+        ok = sum(r["rule_ok"] for r in high) + sum(r["llm_ok"] for r in auto_llm)
+        return {"rule": len(high), "rule_ok": sum(r["rule_ok"] for r in high), "llm": len(auto_llm), "llm_ok": sum(r["llm_ok"] for r in auto_llm),
+                "auto": auto, "ok": ok, "err": auto - ok, "human": N - auto}
+    s0 = simulate(0.7, True, False)
+    print("\n## 7. FY2024 全体の実運用シミュレーション（仮条件: Sonnet confidence >= 0.70 AND needs_review = false）")
+    print(f"- A. 高confidenceルール: {s0['rule']}件 / accuracy {pct(s0['rule_ok'], s0['rule'])}（誤り {s0['rule'] - s0['rule_ok']}）")
+    print(f"- B. Sonnet 自動: {s0['llm']}件 / accuracy {pct(s0['llm_ok'], s0['llm'])}（誤り {s0['llm'] - s0['llm_ok']}）")
+    print(f"- C. 人間確認: {s0['human']}件（{pct(s0['human'], N)}）")
+    print(f"- 自動判定 合計 {s0['auto']}件 / coverage {pct(s0['auto'], N)} / accuracy {pct(s0['ok'], s0['auto'])} / 誤り {s0['err']}件")
+
+    print("\n## 8. 閾値感度（FY2024 全{}件）".format(N))
+    print("| Sonnet 自動条件 | automation coverage | automated accuracy | 誤り | 人間確認 |\n|---|---:|---:|---:|---:|")
+    sims = {}
+    for nr, ex, label in ((False, False, "confidence のみ"), (True, False, "+ needs_review=false"), (True, True, "+ needs_review=false + insufficient除外")):
+        for t in (0.6, 0.7, 0.8, 0.9):
+            x = simulate(t, nr, ex)
+            sims[f"{label}:{t}"] = x
+            print(f"| conf >= {t:.2f} {label} | {x['auto']} ({pct(x['auto'], N)}) | {pct(x['ok'], x['auto'])} | {x['err']} | {x['human']} |")
+    x = {"auto": len(high), "ok": sum(r["rule_ok"] for r in high)}
+    print(f"| 参考: ルールのみ（LLMなし） | {x['auto']} ({pct(x['auto'], N)}) | {pct(x['ok'], x['auto'])} | {x['auto'] - x['ok']} | {N - x['auto']} |")
+
+    print("\n## 10. insufficient_information")
+    ins = [r for r in llm if r["insuff"]]
+    print(f"- true: {len(ins)}件, accuracy {pct(sum(r['llm_ok'] for r in ins), len(ins))}, needs_review=true {sum(1 for r in ins if r['nr'])}件")
+    band = lambda c: ">=0.90" if c >= 0.9 else "0.80-0.89" if c >= 0.8 else "0.70-0.79" if c >= 0.7 else "0.50-0.69" if c >= 0.5 else "<0.50"
+    print("- confidence 分布: " + ", ".join(f"{k}={v}" for k, v in sorted(Counter(band(r["conf"]) for r in ins).items())))
+    print(f"- うち confidence>=0.70 かつ needs_review=false（除外しないと自動処理される件数）: {sum(1 for r in ins if r['conf'] >= 0.7 and r['nr'] is False)}")
+
+    print("\n## reason_category")
+    for k, v in Counter(r["rcat"] for r in llm if r["has_llm"]).most_common():
+        rs = [r for r in llm if r["rcat"] == k]
+        print(f"- {k}: {v}件, accuracy {pct(sum(r['llm_ok'] for r in rs), len(rs))}, 平均confidence {sum(r['conf'] for r in rs) / len(rs):.2f}")
+
+    base = d.parent / "dry_run" / args.results
+    if base.exists():
+        b = {r["transaction_id"]: (r.get("output") or {}).get("primary_account_id") for r in (json.loads(l) for l in base.read_text(encoding="utf-8").splitlines() if l.strip())}
+        common = [r for r in llm if r["transaction_id"] in b]
+        same = sum(1 for r in common if r["llm"] == b[r["transaction_id"]])
+        print(f"\n参考: 40件ベースラインと重なる {len(common)}件で予測が一致 {same}件（今回は reason_category 追加・過去候補は同一）")
+    save_json(d / f"pipeline_eval_{args.results.replace('.jsonl', '')}.json", {"N": N, "high": len(high), "llm": len(llm), "simulations": sims})
 
 
 def cmd_llm_eval(settings: Settings, args) -> None:
@@ -1093,6 +1224,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("llm-prepare", help="Phase 4 dry-run: LLM対象選定・payload作成・コスト見積もり（APIは呼ばない）")
     sp.add_argument("--target-fy", type=int, default=2024)
     sp.add_argument("--sample", type=int, default=40)
+    sp.add_argument("--all", action="store_true", help="高confidence群以外のすべてを対象にする（実運用パイプライン評価）")
+    sp.add_argument("--name", default="dry_run", help="出力サブディレクトリ名")
+    sp.add_argument("--reason-category", action="store_true", help="structured output に reason_category を追加")
     sp.set_defaults(func=cmd_llm_prepare)
 
     sp = sub.add_parser("llm-run", help="Phase 4: dry-run の payload で LLM を呼ぶ（--approve 必須）")
@@ -1100,6 +1234,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
     sp.add_argument("--approve", action="store_true", help="コスト見積もりを確認・承認済みであることを示す")
     sp.add_argument("--count-only", action="store_true", help="count_tokens のみ実行して終了")
+    sp.add_argument("--name", default="dry_run")
+    sp.add_argument("--resume", action="store_true", help="完了済みの明細をスキップして再開")
+    sp.add_argument("--max-cost", type=float, default=10.0, help="推定・累計コストの上限（USD）")
+    sp.add_argument("--expected-output", type=int, default=250, help="想定 output tokens/件（見積もり用）")
     sp.set_defaults(func=cmd_llm_run)
 
     sp = sub.add_parser("llm-tokens", help="Phase 4: count_tokens の差分計測で入力トークンの内訳を確認（推論は行わない）")
@@ -1113,6 +1251,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--a-label", default="Opus")
     sp.add_argument("--b-label", default="Sonnet")
     sp.set_defaults(func=cmd_llm_compare)
+
+    sp = sub.add_parser("llm-pipeline-eval", help="Phase 4: FY2024 全件の実運用パイプライン評価（値は表示しない）")
+    sp.add_argument("--name", default="fy2024_full")
+    sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
+    sp.set_defaults(func=cmd_llm_pipeline_eval)
 
     sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
     sp.add_argument("--results", required=True, help="dry_run 内の results_*.jsonl")

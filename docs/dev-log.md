@@ -348,3 +348,20 @@ LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `l
 
 - 一致: 両方正解 33 / Opusだけ 0 / Sonnetだけ 2 / 両方不正解 5。同じ科目を選んだ 36件の accuracy 91.7%
 - ensemble 候補: 両方>=0.70かつ同一科目 67.5% / 100%、Sonnet>=0.70 のみ 67.5% / 100%、Opus>=0.70 のみ 72.5% / 100%
+
+## Phase 4: FY2024 全件の実運用パイプライン評価（ルール → Sonnet 5 → 人間確認, 2026-09-27）
+
+条件: claude-sonnet-5 / effort medium / caching ON / fallback OFF / 過去候補8件 / 40件ベースラインと同じ prompt（reason_category のみ追加）。MF 書き込みなし。
+`mf llm-prepare --all --name fy2024_full --reason-category` → `llm-run --name fy2024_full`（count_tokens 確認・$10 上限）→ `llm-pipeline-eval`。
+
+- 対象: 1,037件 = 高confidenceルール 321 + LLM 716（A 182 / B 53 / C 336 / C+D 7 / D 28 / E 110）
+  - 指示「高confidence以外はすべて LLM」に従い、前回 LLM対象外だった E（exact・過去1〜2回）110件を含めた
+- 実行: 716件すべて成功、エラー0。usage: input 783,346 / cache write 6,342 / cache read 4,534,530 / output 86,419。実コスト約 $3.35（見積もり $4.28）
+- Sonnet 単体: 84.5%（ルールのみ 66.1%）。A 69.8%（ルール0%）/ B 84.9% / C 93.0% / D 88.6% / E 81.8%（ルール 84.5%）。simple 84.0% / complex 86.6%
+- calibration（716件）: conf≥0.70 69.3% / 93.1%（誤り34）、≥0.80 55.9% / 94.8%、≥0.90 30.7% / 96.8%、≥0.95 10.9% / 98.7%。40件で見えた「≥0.70 で100%」は全件では再現せず
+- 実運用シミュレーション（仮: conf≥0.70 かつ needs_review=false）: ルール 321（97.2%, 誤り9）+ Sonnet 488（93.0%, 誤り34）= 自動 809件（78.0%）/ accuracy 94.7% / 誤り43 / 人間確認 228
+- 閾値感度: conf≥0.90 で coverage 52.2% / 97.0% / 誤り16。ルール + conf≥0.95 で 38.5% / 97.5%。ルール群自体が 97.2% のため、全体 98% 以上には高confidenceルール側の改善が必要
+- 自動処理された誤り34件の内訳: E 15 / C 11 / B 4 / D 3 / A 1。simple 27 / complex 7
+- insufficient_information=true 32件はすべて needs_review=true かつ conf<0.50（除外条件の有無で結果は変わらない）
+- reason_category: exact_history 489（90.4%）/ similar_history 169（76.3%）/ content_semantics 44（63.6%）/ insufficient_information 14（42.9%）
+- 40件ベースラインと重なる40件で予測一致 39/40

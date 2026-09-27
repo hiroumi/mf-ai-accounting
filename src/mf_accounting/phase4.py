@@ -79,19 +79,20 @@ class Catalog:
         return "\n".join(f"{r['code']}\t{r['name']}\t{r['group']}\t{r['category']}" for r in self.rows)
 
 
-def output_schema(catalog: Catalog) -> dict:
-    return {
-        "type": "object",
-        "properties": {
-            "primary_account_code": {"anyOf": [{"type": "string", "enum": sorted(catalog.code_to_id)}, {"type": "null"}]},
-            "confidence": {"type": "number"},
-            "reason": {"type": "string"},
-            "needs_review": {"type": "boolean"},
-            "insufficient_information": {"type": "boolean"},
-        },
-        "required": ["primary_account_code", "confidence", "reason", "needs_review", "insufficient_information"],
-        "additionalProperties": False,
+REASON_CATEGORY_ENUM = ["exact_history", "similar_history", "content_semantics", "amount_or_direction", "insufficient_information"]
+
+
+def output_schema(catalog: Catalog, with_reason_category: bool = False) -> dict:
+    props = {
+        "primary_account_code": {"anyOf": [{"type": "string", "enum": sorted(catalog.code_to_id)}, {"type": "null"}]},
+        "confidence": {"type": "number"},
+        "reason": {"type": "string"},
+        "needs_review": {"type": "boolean"},
+        "insufficient_information": {"type": "boolean"},
     }
+    if with_reason_category:
+        props["reason_category"] = {"type": "string", "enum": REASON_CATEGORY_ENUM}
+    return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
 
 SYSTEM_PROMPT = """あなたは日本の中小企業の経理担当者を補助するアシスタントです。
@@ -110,13 +111,16 @@ SYSTEM_PROMPT = """あなたは日本の中小企業の経理担当者を補助�
 - 人の確認が望ましい場合は needs_review を true にしてください。
 - reason は日本語で1〜2文、判断根拠を簡潔に書いてください。明細に含まれる個人名や番号は reason に書き写さないでください。
 - 消費税区分・仕訳の分割（複合仕訳）は今回は判断しません。主科目のみを回答してください。
-
+{reason_category_rule}
 選択可能な勘定科目（コード\t科目名\tグループ\t区分）:
 """
 
+REASON_CATEGORY_RULE = """- reason_category には主たる判断根拠を1つ選んでください: exact_history（同じ摘要の過去履歴）/ similar_history（似た摘要の過去履歴）/ content_semantics（摘要の意味）/ amount_or_direction（金額帯・入出金方向）/ insufficient_information（情報不足）。
+"""
 
-def system_text(catalog: Catalog) -> str:
-    return SYSTEM_PROMPT + catalog.text()
+
+def system_text(catalog: Catalog, with_reason_category: bool = False) -> str:
+    return SYSTEM_PROMPT.replace("{reason_category_rule}", REASON_CATEGORY_RULE if with_reason_category else "") + catalog.text()
 
 
 # ---- 対象選定 -----------------------------------------------------------------------
@@ -136,7 +140,10 @@ def classify_target(p: dict) -> dict:
         cats.append("C_科目が割れている")
     if exact and p.get("days_since_last", 0) > 365:
         cats.append("D_365日以上未使用")
-    return {"high_confidence": high_conf, "llm_target": bool(cats) and not high_conf, "categories": cats}
+    base_target = bool(cats) and not high_conf
+    if not high_conf and not cats:
+        cats.append("E_exact過去1〜2回")  # A〜D に該当しない非高confidence（exact・一致・観測が少ない）
+    return {"high_confidence": high_conf, "llm_target": base_target, "categories": cats}
 
 
 def stratified_sample(targets: list[dict], n: int = 40, seed: int = 20260927) -> list[dict]:
@@ -299,6 +306,12 @@ def count_tokens(items: list[dict], system: str, schema: dict, model: str, effor
     return counts
 
 
+def shared_tokens(system: str, schema: dict, model: str, effort: str, approved: bool) -> int:
+    """全明細で共通の部分（system + スキーマ等）の tokens。最小の user（1文字）で数えて枠分を引く。"""
+    items = [{"user_text": "x"}]
+    return max(count_tokens(items, system, schema, model, effort, approved)[0] - 8, 0)
+
+
 def _error_message(e) -> str:
     """API エラーの説明文のみ（リクエスト内容や認証情報は含めない）。"""
     body = getattr(e, "body", None)
@@ -327,8 +340,13 @@ def parse_output(resp, catalog: Catalog) -> dict:
     return out
 
 
+def usage_cost(model: str, u: dict) -> float:
+    pin, pout, pcache = PRICES[model]
+    return (u["input"] * pin + u["cache_write"] * pin * 1.25 + u["cache_read"] * pcache + u["output"] * pout) / 1e6
+
+
 def run_llm(items: list[dict], system: str, schema: dict, catalog: Catalog, model: str, effort: str, approved: bool,
-            on_result=None) -> list[dict]:
+            on_result=None, max_cost: float | None = None, spent: float = 0.0) -> list[dict]:
     """items: [{"transaction_id", "user_text"}]。fallback なし。異常時は LLMRunError で停止する。"""
     if not approved:
         raise PermissionError("LLM API の呼び出しにはユーザーの承認フラグが必要です（--approve）。")
@@ -348,6 +366,9 @@ def run_llm(items: list[dict], system: str, schema: dict, catalog: Catalog, mode
         results.append(rec)
         if on_result:
             on_result(rec)
+        spent += usage_cost(model, rec["usage"]) if model in PRICES else 0.0
+        if max_cost is not None and spent > max_cost:
+            raise LLMRunError(f"累計コストが上限 ${max_cost:.2f} を超えました（${spent:.2f}）")
     return results
 
 
