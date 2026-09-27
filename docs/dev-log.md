@@ -279,3 +279,10 @@ LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `l
 - 見積もり（ローカル概算）: system 約3,000 tokens（キャッシュ）+ user 平均約700 tokens/件、output 150〜1,200 tokens/件
   - claude-opus-5: 40件 $0.37〜$1.42、LLM対象全606件 $5.3〜$21.2
 - `check_secrets.py` に Anthropic APIキー（`sk-ant-`）の検出を追加
+
+### Phase 4: 40件実行の準備（ユーザー承認済みの条件, 2026-09-27）
+
+- 条件: `claude-opus-5` / effort=medium / 40件（A/B/C/D 各10件）/ ローリング履歴 / **fallback 無効** / structured outputs / MF 書き込みなし
+- `run_llm`: fallback・SDK自動リトライなし。API エラー・refusal・max_tokens・スキーマ外の出力・選択肢外の科目コード・confidence 範囲外で即停止（結果は1件ずつ保存）
+- `llm-run`: 実行前に count_tokens で実トークン数を確認し、ローカル概算の2倍を超えたら停止
+- `llm-eval`: 層別（件数・accuracy・confidence平均・needs_review・insufficient_information）、confidence帯別accuracy、ルール vs LLM の正誤組み合わせ、reason のキーワード分類（本文は表示しない）

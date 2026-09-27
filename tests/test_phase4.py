@@ -63,4 +63,42 @@ def test_candidates_use_only_past_and_payload_excludes_answer():
 
 def test_run_llm_requires_approval():
     with pytest.raises(PermissionError):
-        phase4.run_llm([], "", {}, None, "claude-opus-5", "medium", approved=False)
+        phase4.run_llm([], "", {}, None, "claude-opus-5", "medium", approved=False)  # API を呼ばずに停止
+
+
+class _Resp:
+    def __init__(self, text, stop="end_turn"):
+        self.stop_reason = stop
+        self.content = [type("B", (), {"type": "text", "text": text})()]
+
+
+def _cat():
+    return phase4.Catalog.from_accounts([{"id": "X%3D", "name": "消耗品費", "available": True}])
+
+
+def test_parse_output_validates_and_maps_code():
+    out = phase4.parse_output(_Resp('{"primary_account_code":"A001","confidence":0.8,"reason":"r","needs_review":false,"insufficient_information":false}'), _cat())
+    assert out["primary_account_id"] == "X%3D"
+
+
+@pytest.mark.parametrize("text,stop", [
+    ('{"primary_account_code":"A999","confidence":0.8,"reason":"r","needs_review":false,"insufficient_information":false}', "end_turn"),
+    ('{"primary_account_code":"A001","confidence":1.5,"reason":"r","needs_review":false,"insufficient_information":false}', "end_turn"),
+    ("not json", "end_turn"),
+    ("{}", "refusal"),
+    ("{}", "max_tokens"),
+])
+def test_parse_output_stops_on_unexpected(text, stop):
+    with pytest.raises(phase4.LLMRunError):
+        phase4.parse_output(_Resp(text, stop), _cat())
+
+
+def test_count_tokens_requires_approval():
+    with pytest.raises(PermissionError):
+        phase4.count_tokens([], "", {}, "claude-opus-5", "medium", approved=False)
+
+
+def test_reason_categories():
+    assert phase4.reason_categories("過去の類似明細で一貫して使用") == ["過去履歴を根拠", "類似取引を根拠"]
+    assert phase4.reason_categories("情報が不足しており判断できない") == ["情報不足"]
+    assert phase4.reason_categories("") == ["その他"]

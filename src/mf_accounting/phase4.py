@@ -258,45 +258,87 @@ def estimate_cost(model: str, system_tokens: int, user_tokens: list[int], out_to
 # ---- LLM 呼び出し（承認後のみ） ----------------------------------------------------------
 
 
-def run_llm(items: list[dict], system: str, schema: dict, catalog: Catalog, model: str, effort: str, approved: bool) -> list[dict]:
-    """items: [{"transaction_id", "user_text"}]。approved=False の場合は呼び出さない。"""
+class LLMRunError(RuntimeError):
+    """API エラー・拒否・想定外のレスポンス。fallback せずに停止する。"""
+
+
+def _request(system: str, schema: dict, user_text: str, model: str, effort: str) -> dict:
+    return {
+        "model": model,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": user_text}],
+    }
+
+
+def count_tokens(items: list[dict], system: str, schema: dict, model: str, effort: str, approved: bool) -> list[int]:
+    """count_tokens API で実際の入力トークン数を数える（payload は Anthropic に送信される）。"""
+    if not approved:
+        raise PermissionError("count_tokens も payload を送信するため、承認フラグが必要です（--approve）。")
+    import anthropic
+
+    client = anthropic.Anthropic()
+    return [client.messages.count_tokens(**_request(system, schema, it["user_text"], model, effort)).input_tokens for it in items]
+
+
+def parse_output(resp, catalog: Catalog) -> dict:
+    if resp.stop_reason != "end_turn":
+        raise LLMRunError(f"想定外の stop_reason: {resp.stop_reason}")
+    text = next((b.text for b in resp.content if b.type == "text"), None)
+    if text is None:
+        raise LLMRunError("テキストブロックがありません")
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise LLMRunError("JSON として解釈できない出力") from e
+    code = out.get("primary_account_code")
+    if code is not None and code not in catalog.code_to_id:
+        raise LLMRunError("選択肢にない勘定科目コード")
+    conf = out.get("confidence")
+    if not isinstance(conf, (int, float)) or not 0.0 <= conf <= 1.0:
+        raise LLMRunError("confidence が 0〜1 の数値ではありません")
+    out["primary_account_id"] = catalog.code_to_id.get(code) if code else None
+    return out
+
+
+def run_llm(items: list[dict], system: str, schema: dict, catalog: Catalog, model: str, effort: str, approved: bool,
+            on_result=None) -> list[dict]:
+    """items: [{"transaction_id", "user_text"}]。fallback なし。異常時は LLMRunError で停止する。"""
     if not approved:
         raise PermissionError("LLM API の呼び出しにはユーザーの承認フラグが必要です（--approve）。")
     import anthropic
 
-    client = anthropic.Anthropic()  # 認証情報は環境変数 / ant プロファイルから。ログには出さない
+    client = anthropic.Anthropic(max_retries=0)  # 自動リトライ・fallback なし。認証情報はログに出さない
     results = []
     for it in items:
-        resp = client.beta.messages.create(
-            model=model,
-            max_tokens=4096,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            thinking={"type": "adaptive"},
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
-            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": it["user_text"]}],
-        )
+        try:
+            resp = client.messages.create(max_tokens=4096, **_request(system, schema, it["user_text"], model, effort))
+        except anthropic.APIError as e:
+            raise LLMRunError(f"API エラー: {type(e).__name__} (status={getattr(e, 'status_code', None)})") from None
         rec = {"transaction_id": it["transaction_id"], "model": resp.model, "stop_reason": resp.stop_reason,
                "usage": {"input": resp.usage.input_tokens, "output": resp.usage.output_tokens,
-                         "cache_read": resp.usage.cache_read_input_tokens, "cache_write": resp.usage.cache_creation_input_tokens}}
-        if resp.stop_reason == "refusal":
-            rec["error"] = "refusal"
-        else:
-            text = next((b.text for b in resp.content if b.type == "text"), "")
-            try:
-                out = json.loads(text)
-                code = out.get("primary_account_code")
-                if code is not None and code not in catalog.code_to_id:
-                    raise ValueError("unknown account code")
-                conf = float(out.get("confidence"))
-                out["confidence"] = min(max(conf, 0.0), 1.0)
-                out["primary_account_id"] = catalog.code_to_id.get(code) if code else None
-                rec["output"] = out
-            except (ValueError, TypeError, json.JSONDecodeError) as e:
-                rec["error"] = f"invalid_output: {type(e).__name__}"
+                         "cache_read": resp.usage.cache_read_input_tokens or 0, "cache_write": resp.usage.cache_creation_input_tokens or 0}}
+        rec["output"] = parse_output(resp, catalog)  # 異常なら LLMRunError
         results.append(rec)
+        if on_result:
+            on_result(rec)
     return results
+
+
+REASON_CATEGORIES = [
+    ("情報不足", ("不足", "不明", "判断できない", "特定できない", "判別できない", "情報が少な")),
+    ("過去履歴を根拠", ("過去", "履歴", "これまで", "一貫", "従来", "前回")),
+    ("類似取引を根拠", ("類似", "似た", "同様", "近い", "同種")),
+    ("金額/入出金方向を根拠", ("金額", "入金", "出金", "少額", "高額")),
+    ("contentの意味から判断", ("摘要", "内容", "名称", "サービス", "店", "利用", "手数料", "から判断", "と考え", "と推定")),
+]
+
+
+def reason_categories(reason: str | None) -> list[str]:
+    r = reason or ""
+    cats = [name for name, kws in REASON_CATEGORIES if any(k in r for k in kws)]
+    return cats or ["その他"]
 
 
 def days_between(a: str, b: str) -> int:

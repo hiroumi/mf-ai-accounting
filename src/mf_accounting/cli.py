@@ -862,39 +862,106 @@ def cmd_llm_run(settings: Settings, args) -> None:
         raise ConfigError("勘定科目カタログが dry-run 時と異なります。llm-prepare をやり直してください。")
     system = (dry / "system_prompt.txt").read_text(encoding="utf-8")
     schema = load_json(dry / "output_schema.json")
-    results = phase4.run_llm(items, system, schema, catalog, args.model, args.effort, approved=args.approve)
-    (dry / f"results_{args.model}_{args.effort}.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in results) + "\n", encoding="utf-8")
-    print(f"{len(results)}件 完了。保存先: {dry}")
+
+    # 1. 実際の入力トークン数
+    est = [phase4.estimate_tokens(system) + phase4.estimate_tokens(json.dumps(schema)) + phase4.estimate_tokens(i["user_text"]) for i in items]
+    counts = phase4.count_tokens(items, system, schema, args.model, args.effort, approved=args.approve)
+    save_json(dry / "token_counts.json", {"model": args.model, "counts": counts, "estimates": est})
+    print(f"count_tokens: 合計 {sum(counts):,} tokens（1件 平均 {sum(counts) // len(counts):,} / 最小 {min(counts):,} / 最大 {max(counts):,}）、ローカル概算 {sum(est):,}")
+    if sum(counts) > 2 * sum(est):
+        raise ConfigError("実際のトークン数が見積もりの2倍を超えたため、実行せずに停止しました。")
+    if args.count_only:
+        return
+
+    # 2. 実行（1件ずつ保存。異常時は停止）
+    path = dry / f"results_{args.model}_{args.effort}.jsonl"
+    path.write_text("", encoding="utf-8")
+    def append(rec):
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        results = phase4.run_llm(items, system, schema, catalog, args.model, args.effort, approved=args.approve, on_result=append)
+    except phase4.LLMRunError as e:
+        done = sum(1 for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
+        print(f"[停止] {e}（{done}/{len(items)}件で停止。fallback はしていません）", file=sys.stderr)
+        raise SystemExit(5)
+    u = [r["usage"] for r in results]
+    print(f"{len(results)}件 完了。usage 合計: input {sum(x['input'] for x in u):,} / cache_write {sum(x['cache_write'] for x in u):,} / "
+          f"cache_read {sum(x['cache_read'] for x in u):,} / output {sum(x['output'] for x in u):,} tokens")
+    price = phase4.PRICES.get(args.model)
+    if price:
+        pin, pout, pcache = price
+        cost = (sum(x["input"] for x in u) * pin + sum(x["cache_write"] for x in u) * pin * 1.25 + sum(x["cache_read"] for x in u) * pcache + sum(x["output"] for x in u) * pout) / 1e6
+        print(f"推定コスト（usage から計算）: ${cost:.2f}")
+    print(f"保存先: {path}")
 
 
 def cmd_llm_eval(settings: Settings, args) -> None:
-    """LLM 結果を正解（送信していないファイル）と照合する。件数・率のみ表示。"""
+    """LLM 結果を正解（送信していないファイル）と照合する。件数・率のみ表示し、reason の本文は表示しない。"""
     office_code = settings.require_office_code()
     dry = processed_dir(settings.data_dir, office_code) / "phase4" / "dry_run"
     res = {r["transaction_id"]: r for r in (json.loads(l) for l in (dry / args.results).read_text(encoding="utf-8").splitlines() if l.strip())}
     ans = [json.loads(l) for l in (dry / "answers_not_sent.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    layer = lambda c: next((k[0] for k in ("B_fuzzy候補のみ", "A_候補なし", "C_科目が割れている", "D_365日以上未使用") if k in c), "?")
     rows = []
     for a in ans:
-        r = res.get(a["transaction_id"], {})
-        o = r.get("output") or {}
-        rows.append({**a, "llm_pred": o.get("primary_account_id"), "confidence": o.get("confidence"), "needs_review": o.get("needs_review"),
-                     "insufficient": o.get("insufficient_information"), "error": r.get("error")})
-    def acc(rs, key="llm_pred"):
-        rs = [x for x in rs if x[key]]
-        ok = sum(1 for x in rs if x[key] == x["actual_primary_account_id"])
-        return f"{ok}/{len(rs)} ({_pct(ok / len(rs) if rs else None)})"
-    print(f"LLM対象（サンプル）: {len(rows)}件 / 回答あり {sum(1 for x in rows if x['llm_pred'])} / エラー {sum(1 for x in rows if x['error'])} / insufficient_information {sum(1 for x in rows if x['insufficient'])}")
-    print(f"主科目 accuracy — LLM: {acc(rows)} / ルールのみ（同じ明細）: {acc(rows, 'rule_pred')}")
-    print("| 区分 | 値 | LLM accuracy |\n|---|---|---:|")
-    for title, key, order in (
-        ("confidence", lambda x: None if x["confidence"] is None else ">=0.9" if x["confidence"] >= 0.9 else "0.7-0.9" if x["confidence"] >= 0.7 else "<0.7", [">=0.9", "0.7-0.9", "<0.7"]),
-        ("needs_review", lambda x: x["needs_review"], [False, True]),
-        ("層", lambda x: next((c[0] for c in ("B_fuzzy候補のみ", "A_候補なし", "C_科目が割れている", "D_365日以上未使用") if c in x["categories"]), "?"), ["A", "B", "C", "D"]),
-        ("構造", lambda x: "complex" if x["actual_complex"] else "simple", ["simple", "complex"]),
-    ):
-        for k in order:
-            print(f"| {title} | {k} | {acc([x for x in rows if key(x) == k])} |")
-    save_json(dry / f"eval_{args.results.replace('.jsonl', '')}.json", {"rows": len(rows)})
+        o = (res.get(a["transaction_id"]) or {}).get("output") or {}
+        lay = layer(a["categories"])
+        rule_pred = None if lay == "A" else a["rule_pred"]  # A層はルールの有効な候補なし（fuzzy<70 or 候補なし）
+        rows.append({"layer": lay, "complex": a["actual_complex"], "actual": a["actual_primary_account_id"],
+                     "llm": o.get("primary_account_id"), "rule": rule_pred, "conf": o.get("confidence"),
+                     "review": o.get("needs_review"), "insuff": o.get("insufficient_information"),
+                     "reasons": phase4.reason_categories(o.get("reason")), "answered": bool(o)})
+    for r in rows:
+        r["llm_ok"] = r["llm"] is not None and r["llm"] == r["actual"]
+        r["rule_ok"] = r["rule"] is not None and r["rule"] == r["actual"]
+
+    def line(rs):
+        n = len(rs)
+        ok = sum(r["llm_ok"] for r in rs)
+        confs = [r["conf"] for r in rs if r["conf"] is not None]
+        rok = sum(r["rule_ok"] for r in rs)
+        return (f"| {n} | {ok} ({_pct(ok / n if n else None)}) | {rok} ({_pct(rok / n if n else None)}) | "
+                f"{(sum(confs) / len(confs)) if confs else 0:.2f} | {sum(1 for r in rs if r['review'])} | {sum(1 for r in rs if r['insuff'])} |")
+    print(f"回答あり {sum(r['answered'] for r in rows)}/{len(rows)}件\n")
+    print("## 層別（A=候補なし, B=fuzzy候補のみ, C=科目が割れている, D=365日以上未使用）")
+    print("| 層 | 件数 | LLM 主科目 accuracy | ルールのみ accuracy | confidence 平均 | needs_review | insufficient_information |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
+    for lay in "ABCD":
+        print(f"| {lay} " + line([r for r in rows if r["layer"] == lay]))
+    print("| 全体 " + line(rows))
+    print("| (simple) " + line([r for r in rows if not r["complex"]]))
+    print("| (complex) " + line([r for r in rows if r["complex"]]))
+
+    band = lambda c: "0.90以上" if c >= 0.9 else "0.80〜0.89" if c >= 0.8 else "0.70〜0.79" if c >= 0.7 else "0.70未満"
+    bands = ["0.90以上", "0.80〜0.89", "0.70〜0.79", "0.70未満"]
+    print("\n## confidence 帯ごとの accuracy（LLM 自己評価と実際の正解率）")
+    print("| confidence | 全体 件数 / accuracy | " + " | ".join(f"{l}層" for l in "ABCD") + " |")
+    print("|---|---:|" + "---:|" * 4)
+    for b in bands:
+        rs = [r for r in rows if r["conf"] is not None and band(r["conf"]) == b]
+        cell = lambda xs: f"{sum(x['llm_ok'] for x in xs)}/{len(xs)}" if xs else "-"
+        print(f"| {b} | {len(rs)} / {_pct(sum(r['llm_ok'] for r in rs) / len(rs) if rs else None)} | " + " | ".join(cell([r for r in rs if r["layer"] == l]) for l in "ABCD") + " |")
+    for key, title in (("review", "needs_review"), ("insuff", "insufficient_information")):
+        for v in (False, True):
+            rs = [r for r in rows if bool(r[key]) == v]
+            print(f"- {title}={str(v).lower()}: {len(rs)}件, accuracy {_pct(sum(r['llm_ok'] for r in rs) / len(rs) if rs else None)}")
+
+    print("\n## ルール vs LLM")
+    grid = Counter((r["rule_ok"], r["llm_ok"]) for r in rows)
+    print(f"- LLMのみ正解: {grid[(False, True)]} / ルールのみ正解: {grid[(True, False)]} / 両方正解: {grid[(True, True)]} / 両方不正解: {grid[(False, False)]}")
+    for lay in "ABCD":
+        g = Counter((r["rule_ok"], r["llm_ok"]) for r in rows if r["layer"] == lay)
+        print(f"  - {lay}層: LLMのみ {g[(False, True)]} / ルールのみ {g[(True, False)]} / 両方 {g[(True, True)]} / 両方不正解 {g[(False, False)]}")
+
+    print("\n## reason のカテゴリ（キーワードによる自動分類, 複数該当あり）")
+    rc = Counter(c for r in rows for c in r["reasons"])
+    print("- " + ", ".join(f"{k}={v}" for k, v in rc.most_common()))
+    for c in [k for k, _ in rc.most_common()]:
+        rs = [r for r in rows if c in r["reasons"]]
+        print(f"  - {c}: {len(rs)}件, accuracy {_pct(sum(r['llm_ok'] for r in rs) / len(rs))}")
+    save_json(dry / f"eval_{args.results.replace('.jsonl', '')}.json",
+              {"rows": [{k: v for k, v in r.items() if k not in ("actual", "llm", "rule")} for r in rows]})
 
 
 # ---- entry ------------------------------------------------------------------
@@ -963,6 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", default="claude-opus-5")
     sp.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
     sp.add_argument("--approve", action="store_true", help="コスト見積もりを確認・承認済みであることを示す")
+    sp.add_argument("--count-only", action="store_true", help="count_tokens のみ実行して終了")
     sp.set_defaults(func=cmd_llm_run)
 
     sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
