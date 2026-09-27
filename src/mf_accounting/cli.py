@@ -23,7 +23,7 @@ from .client import MFAccountingClient, MFApiError
 from .config import ConfigError, Settings, load_settings
 from .guard import ForbiddenRequestError, GuardedSession
 from .inspect_json import format_summary, summarize, value_counts
-from . import phase2, phase3, phase4, phase25
+from . import phase2, phase3, phase4, phase25, routing
 from .quality import format_report, quality_report
 from .validate import DataValidationError, validate_journals, validate_transactions
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
@@ -1096,6 +1096,19 @@ def cmd_llm_pipeline_eval(settings: Settings, args) -> None:
     save_json(d / f"pipeline_eval_{args.results.replace('.jsonl', '')}.json", {"N": N, "high": len(high), "llm": len(llm), "simulations": sims})
 
 
+def cmd_route_eval(settings: Settings, args) -> None:
+    """候補ルーティングを FY2024 全件で評価（LLM API は呼ばない。件数・率のみ）。"""
+    rows, accounts, out = _phase4_context(settings)
+    d = out / args.name
+    rules = load_json(d / "pipeline_rules_not_sent.json")
+    res = {r["transaction_id"]: r["output"] for r in (json.loads(l) for l in (d / args.results).read_text(encoding="utf-8").splitlines() if l.strip())}
+    items = routing.build_items(rows, rules, res, {a["id"]: a for a in accounts})
+    print(f"| 案 | automation coverage | automated accuracy | 誤り | 人間確認 | 内訳 |\n|---|---:|---:|---:|---:|---|")
+    for name, t in routing.PLANS.items():
+        r = routing.route(items, routing.plan(t))
+        print(f"| {name}（Sonnet conf>={t}） | {r['auto']} ({r['coverage']:.1%}) | {_pct(r['accuracy'])} | {r['errors']} | {r['human']} | ルール {r['by'].get('rule', 0)} / Sonnet {r['by'].get('llm', 0)} |")
+
+
 def cmd_llm_eval(settings: Settings, args) -> None:
     """LLM 結果を正解（送信していないファイル）と照合する。件数・率のみ表示し、reason の本文は表示しない。"""
     office_code = settings.require_office_code()
@@ -1256,6 +1269,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name", default="fy2024_full")
     sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
     sp.set_defaults(func=cmd_llm_pipeline_eval)
+
+    sp = sub.add_parser("route-eval", help="Phase 4.5: 候補ルーティングの評価（LLM API は呼ばない）")
+    sp.add_argument("--name", default="fy2024_full")
+    sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
+    sp.set_defaults(func=cmd_route_eval)
 
     sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
     sp.add_argument("--results", required=True, help="dry_run 内の results_*.jsonl")

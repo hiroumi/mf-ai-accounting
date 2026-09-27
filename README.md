@@ -50,6 +50,8 @@ mf analyze3                      # Phase 3: 正規化 + fuzzy matching による
 mf llm-prepare                   # Phase 4: LLM対象の選定・payload作成・コスト見積もり（APIは呼ばない）
 mf llm-run --approve             # Phase 4: 承認後のみ LLM を呼ぶ（Claude API）
 mf llm-eval --results results_claude-opus-5_medium.jsonl
+mf llm-pipeline-eval             # FY2024 全件パイプライン評価
+mf route-eval                    # Phase 4.5: 候補ルーティングの評価（LLM API は呼ばない）
 ```
 
 `--start YYYY-MM-DD --end YYYY-MM-DD` で少量取得の期間を指定できます。

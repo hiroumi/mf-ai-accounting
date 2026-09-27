@@ -365,3 +365,37 @@ LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `l
 - insufficient_information=true 32件はすべて needs_review=true かつ conf<0.50（除外条件の有無で結果は変わらない）
 - reason_category: exact_history 489（90.4%）/ similar_history 169（76.3%）/ content_semantics 44（63.6%）/ insufficient_information 14（42.9%）
 - 40件ベースラインと重なる40件で予測一致 39/40
+
+## Phase 4.5: 誤判定の原因分析とルーティング設計（LLM API 呼び出しなし, 2026-09-27）
+
+`routing.py` / `mf route-eval`。特徴量は各明細の取引日より前の履歴のみから計算。正解ラベルは誤りの比較（分析）のみに使用。
+
+### 高confidenceルールの誤り9件
+- 共通点: **今回の連携口座がその content の過去履歴にない**（誤り 5/9、正解 7/312）。履歴が1年度内のみ（誤り 8/9）
+- 直近2/3/5件の一致・入出金方向・年度をまたいだ科目変更は差がない（高confidence群はすべて一致）
+- 「口座が過去履歴にある」を条件に加えると3年度とも改善（FY2022 98.9→99.2%, FY2023 97.8→98.3%, FY2024 97.2→98.7%, coverage −1〜3pt）。「2年度以上」は年度により逆効果のため不採用
+
+### Sonnet 自動判定の誤り34件（conf>=0.70, needs_review=false の 488件）
+- confidence 帯: 0.70–0.79 85% / 0.80–0.89 92% / 0.90–0.94 96% / 0.95+ 99%
+- 口座が過去履歴にない 50件で accuracy 80%（誤り10）。履歴1件 84%、10件以上 97%
+- 層: E 15件・C 11件が多い。ルールとの一致は confidence 単独と同等の効果しかないが、**不一致は強い警告**（Sonnet accuracy 61%）
+
+### E層（exact・過去1〜2回, 110件）
+- 両方正解 90 / ルールのみ 3 / Sonnetのみ 0 / 両方不正解 17。history 1件: ルール 82.8% / Sonnet 78.1%、2件: 87.0% / 87.0%
+- Sonnet が E でルールを上回るケースはない。E の自動化は Sonnet conf>=0.90 のみ（37%, 92.7%）でも 98% に届かない
+
+### reason_category
+- similar_history / content_semantics は conf>=0.80 がほぼ出ない（計9件）。カテゴリ別閾値を決めるにはデータ不足
+
+### 候補ルーティング（FY2024 1,037件）
+共通: 高confidenceルールは口座が過去履歴にある場合のみ / Sonnet は needs_review=false・ルール予測と不一致なら人間・口座が過去履歴にないなら人間
+
+| 案 | coverage | accuracy | 誤り | 人間確認 |
+|---|---:|---:|---:|---:|
+| 現行（仮） | 78.0% | 94.7% | 43 | 228 |
+| Aggressive（Sonnet conf>=0.80） | 64.3% | 97.8% | 15 | 370 |
+| Balanced（Sonnet conf>=0.90） | 49.1% | 98.4% | 8 | 528 |
+| Conservative（Sonnet conf>=0.95） | 37.0% | 98.7% | 5 | 653 |
+
+- accuracy>=98%: 最大 coverage 49.1%（Balanced）。accuracy>=99%: シンプルな条件では達成不可（ルール群自体が 98.7%）
+- 注意: 高confidence群で口座が初めての12件は LLM 未送信のため人間扱いで試算
