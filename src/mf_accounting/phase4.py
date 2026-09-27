@@ -351,6 +351,98 @@ def run_llm(items: list[dict], system: str, schema: dict, catalog: Catalog, mode
     return results
 
 
+# ---- トークン内訳の差分計測（count_tokens のみ。推論は行わない） ---------------------------
+
+SAMPLE_OUTPUTS = {  # 出力 JSON の長さの目安（reason の長さ違い）
+    "reason 短（約40字）": {"primary_account_code": "A012", "confidence": 0.85, "reason": "過去の同一明細で一貫して同じ科目が使われており、今回も同じ取引と判断した。",
+                        "needs_review": False, "insufficient_information": False},
+    "reason 長（約120字）": {"primary_account_code": "A012", "confidence": 0.62,
+                         "reason": "摘要からサービス利用料の支払いと考えられるが、過去の類似明細では複数の科目が使われており、金額帯も過去と異なるため、最も多く使われている科目を暫定的に選んだ。取引内容の確認が望ましい。",
+                         "needs_review": True, "insufficient_information": False},
+}
+
+
+def _request_for(model: str, system: str | None, schema: dict | None, user_text: str, effort: str | None, thinking: bool) -> dict:
+    req: dict = {"model": model, "messages": [{"role": "user", "content": user_text}]}
+    if thinking:
+        req["thinking"] = {"type": "adaptive"}
+    oc = {}
+    if effort:
+        oc["effort"] = effort
+    if schema:
+        oc["format"] = {"type": "json_schema", "schema": schema}
+    if oc:
+        req["output_config"] = oc
+    if system:
+        req["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+    return req
+
+
+def model_options(model: str) -> dict:
+    """モデルごとの設定（Haiku 4.5 は adaptive thinking / effort 非対応）。"""
+    if model.startswith("claude-haiku"):
+        return {"thinking": False, "effort": None}
+    return {"thinking": True, "effort": "medium"}
+
+
+def token_breakdown(items: list[dict], catalog_text: str, schema: dict, models: list[str], approved: bool, sleep=None) -> dict:
+    if not approved:
+        raise PermissionError("count_tokens は payload を送信するため、承認フラグが必要です（--approve）。")
+    import time
+
+    import anthropic
+
+    client = make_client(max_retries=3)
+    sleep = sleep or time.sleep
+
+    def count(req: dict) -> int:
+        try:
+            n = client.messages.count_tokens(**req).input_tokens
+        except anthropic.APIError as e:
+            raise LLMRunError(f"count_tokens で API エラー: {type(e).__name__} (status={getattr(e, 'status_code', None)}): {_error_message(e)}") from None
+        sleep(0.2)
+        return n
+
+    instructions = SYSTEM_PROMPT
+    full_system = SYSTEM_PROMPT + catalog_text
+    out: dict = {}
+    for model in models:
+        opt = model_options(model)
+        th, ef = opt["thinking"], opt["effort"]
+        r0 = count(_request_for(model, None, None, "x", None, False))
+        r1 = count(_request_for(model, None, None, "x", ef, th))
+        r2 = count(_request_for(model, None, schema, "x", ef, th))
+        r3 = count(_request_for(model, instructions, schema, "x", ef, th))
+        r4 = count(_request_for(model, full_system, schema, "x", ef, th))
+        wrap = count(_request_for(model, full_system, schema, user_text({"transaction": {}, "past_similar_transactions": []}), ef, th))
+        full, tx_only = [], []
+        for it in items:
+            full.append(count(_request_for(model, full_system, schema, it["user_text"], ef, th)))
+            p = dict(it["payload"])
+            p["past_similar_transactions"] = []
+            tx_only.append(count(_request_for(model, full_system, schema, user_text(p), ef, th)))
+        outs = {k: count(_request_for(model, None, None, json.dumps(v, ensure_ascii=False), None, False)) - r0 + 1 for k, v in SAMPLE_OUTPUTS.items()}
+        n = len(items)
+        out[model] = {
+            "total": sum(full),
+            "per_item_avg": sum(full) / n,
+            "shared": {
+                "message_overhead": r0,
+                "thinking_effort_config": r1 - r0,
+                "output_schema": r2 - r1,
+                "system_instructions": r3 - r2,
+                "account_catalog": r4 - r3,
+            },
+            "per_item": {
+                "wrapper_text": wrap - r4 + 1,
+                "transaction": sum(t - wrap for t in tx_only) / n,
+                "past_candidates": sum(f - t for f, t in zip(full, tx_only)) / n,
+            },
+            "output_json_samples": outs,
+        }
+    return out
+
+
 REASON_CATEGORIES = [
     ("情報不足", ("不足", "不明", "判断できない", "特定できない", "判別できない", "情報が少な")),
     ("過去履歴を根拠", ("過去", "履歴", "これまで", "一貫", "従来", "前回")),

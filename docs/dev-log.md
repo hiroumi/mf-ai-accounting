@@ -286,3 +286,27 @@ LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `l
 - `run_llm`: fallback・SDK自動リトライなし。API エラー・refusal・max_tokens・スキーマ外の出力・選択肢外の科目コード・confidence 範囲外で即停止（結果は1件ずつ保存）
 - `llm-run`: 実行前に count_tokens で実トークン数を確認し、ローカル概算の2倍を超えたら停止
 - `llm-eval`: 層別（件数・accuracy・confidence平均・needs_review・insufficient_information）、confidence帯別accuracy、ルール vs LLM の正誤組み合わせ、reason のキーワード分類（本文は表示しない）
+
+### Phase 4: 入力トークンの内訳とコスト構造（count_tokens の差分計測, 推論なし）
+
+`mf llm-tokens --approve`（count_tokens のみ）。40件, claude-opus-5 / effort medium。
+
+| 部分 | tokens/件 |
+|---|---:|
+| system 指示 | 553 |
+| 勘定科目一覧（120科目, コード・名称・グループ・区分） | 4,518 |
+| 出力スキーマ（structured outputs） | 1,072 |
+| thinking/effort 設定・メッセージ枠 | 7 |
+| **共通部分 計** | **6,150** |
+| 明細情報 | 95 |
+| 過去候補（最大8件） | 973 |
+| 定型文・JSON枠 | 41 |
+| **明細ごと 計** | **1,109** |
+
+- 40件合計 290,338 = 共通部分×40 が 246,000（85%）、明細ごとが 44,338（15%）。主因は共通情報（特に勘定科目一覧）を毎回数えていること
+- Sonnet 5 は Opus 5 と同じトークン数。Haiku 4.5 は合計 210,701（トークナイザーが異なる）
+- 出力 JSON は約80〜130 tokens。これに adaptive thinking のトークンが加わる（推論前には測定不可）
+- 推定コスト（40件, キャッシュは system 5,071 tokens のみ対象とする保守的前提, 思考 0/300/1,000 tokens/件）
+  - opus-5: キャッシュなし $1.56 / $1.86 / $2.56、あり $0.68 / $0.98 / $1.68
+  - sonnet-5: キャッシュなし $0.62 / $0.74 / $1.02、あり $0.27 / $0.39 / $0.67
+  - haiku-4-5: $0.23（思考なし。system 3,223 tokens が最小キャッシュサイズ 4,096 未満のためキャッシュ不可）

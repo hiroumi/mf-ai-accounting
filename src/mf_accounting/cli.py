@@ -900,6 +900,32 @@ def cmd_llm_run(settings: Settings, args) -> None:
     print(f"保存先: {path}")
 
 
+def cmd_llm_tokens(settings: Settings, args) -> None:
+    """count_tokens の差分計測で入力トークンの内訳を出し、モデル別コストを試算する（推論は行わない）。"""
+    rows, accounts, out = _phase4_context(settings)
+    dry = out / "dry_run"
+    items = [json.loads(l) for l in (dry / "payloads.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    catalog = phase4.Catalog.from_accounts(accounts, available_only=True)
+    schema = load_json(dry / "output_schema.json")
+    try:
+        bd = phase4.token_breakdown(items, catalog.text(), schema, args.models, approved=args.approve)
+    except phase4.LLMRunError as e:
+        print(f"[停止] {e}", file=sys.stderr)
+        raise SystemExit(5)
+    save_json(dry / "token_breakdown.json", bd)
+    n = len(items)
+    for model, b in bd.items():
+        sh, pi = b["shared"], b["per_item"]
+        shared_total = sum(sh.values())
+        print(f"\n## {model}（{n}件）")
+        print(f"- 40件合計 input: {b['total']:,} / 1件平均: {b['per_item_avg']:,.0f}")
+        print(f"- 共通部分: 合計 {shared_total:,}/件 = system指示 {sh['system_instructions']:,} + 勘定科目一覧 {sh['account_catalog']:,} + 出力スキーマ {sh['output_schema']:,} + thinking/effort設定 {sh['thinking_effort_config']:,} + メッセージ枠 {sh['message_overhead']:,}")
+        print(f"- 明細ごと: 平均 {sum(pi.values()):,.0f}/件 = 明細情報 {pi['transaction']:,.0f} + 過去候補 {pi['past_candidates']:,.0f} + 定型文・JSON枠 {pi['wrapper_text']:,.0f}")
+        print(f"- 40件合計の内訳: 共通部分×{n} = {shared_total * n:,}（{shared_total * n / b['total']:.0%}） / 明細ごと = {b['total'] - shared_total * n:,}（{(b['total'] - shared_total * n) / b['total']:.0%}）")
+        print("- 出力JSONのtoken数（見本）: " + ", ".join(f"{k} ≈ {v}" for k, v in b["output_json_samples"].items()))
+    print(f"\n保存先: {dry / 'token_breakdown.json'}")
+
+
 def cmd_llm_eval(settings: Settings, args) -> None:
     """LLM 結果を正解（送信していないファイル）と照合する。件数・率のみ表示し、reason の本文は表示しない。"""
     office_code = settings.require_office_code()
@@ -1036,6 +1062,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--approve", action="store_true", help="コスト見積もりを確認・承認済みであることを示す")
     sp.add_argument("--count-only", action="store_true", help="count_tokens のみ実行して終了")
     sp.set_defaults(func=cmd_llm_run)
+
+    sp = sub.add_parser("llm-tokens", help="Phase 4: count_tokens の差分計測で入力トークンの内訳を確認（推論は行わない）")
+    sp.add_argument("--models", nargs="+", default=["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"])
+    sp.add_argument("--approve", action="store_true")
+    sp.set_defaults(func=cmd_llm_tokens)
 
     sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
     sp.add_argument("--results", required=True, help="dry_run 内の results_*.jsonl")

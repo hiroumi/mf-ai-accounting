@@ -102,3 +102,15 @@ def test_reason_categories():
     assert phase4.reason_categories("過去の類似明細で一貫して使用") == ["過去履歴を根拠", "類似取引を根拠"]
     assert phase4.reason_categories("情報が不足しており判断できない") == ["情報不足"]
     assert phase4.reason_categories("") == ["その他"]
+
+
+def test_token_breakdown_requires_approval():
+    with pytest.raises(PermissionError):
+        phase4.token_breakdown([], "", {}, ["claude-opus-5"], approved=False)
+
+
+def test_model_options_haiku_has_no_adaptive_thinking():
+    assert phase4.model_options("claude-haiku-4-5") == {"thinking": False, "effort": None}
+    assert phase4.model_options("claude-opus-5")["thinking"] is True
+    req = phase4._request_for("claude-haiku-4-5", "s", {"type": "object"}, "u", None, False)
+    assert "thinking" not in req and req["output_config"] == {"format": {"type": "json_schema", "schema": {"type": "object"}}}
