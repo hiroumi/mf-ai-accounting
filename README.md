@@ -54,7 +54,7 @@ data/                                           # Git管理外
 └── processed/{office_code}/
     ├── journal_lines.csv                # 仕訳明細行（1 branch = 1行、借方/貸方を横持ち）
     ├── transactions.csv                 # 連携明細
-    ├── transaction_journal_lines.csv    # 元明細 → 採用された仕訳
+    ├── training_pairs.csv               # 元明細 → 採用された仕訳（1行 = 明細×仕訳の明細行）
     └── accounts.csv など                # マスター
 ```
 

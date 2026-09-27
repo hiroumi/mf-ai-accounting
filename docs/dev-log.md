@@ -105,3 +105,22 @@
   - 取引日一致 10/10、連携口座の補助科目 = 仕訳の口座側補助科目 10/10
   - 金額: 仕訳の口座側（貸方−借方）= 明細金額 10/10。単純な借方合計では一致しない（税抜経理・複数行仕訳のため）
 - IDはURLエンコード済み文字列（`%2B` 等）で返る。`transaction_ids` 指定時は一度デコードして渡す（二重エンコード防止、テスト追加）
+
+### Step 5: CSV変換（少量データで確認）
+
+- 入力: FY2024 仕訳サンプル10件 + `linkcheck` で取得した紐付き仕訳10件（計20件）、明細10件、マスター
+- `training_pairs.csv` を新設（旧 `transaction_journal_lines.csv` を置き換え）
+  - 1行 = (明細, 仕訳の明細行)。`journal_id` + `branch_index` / `branch_count` で複数行仕訳を復元可能
+  - `fiscal_year` / `term_tax_method` / `term_accounting_method`（取引日→会計期間→課税方式）を保持
+  - `bank_side`（明細行のどちら側が口座か）、`bank_net_amount` / `amount_matches_tx`（口座側純額と明細金額の一致）
+- 結果
+
+| ファイル | 行数 | 列数 |
+|---|---:|---:|
+| journal_lines.csv | 27（仕訳20件） | 47 |
+| transactions.csv | 10 | 16 |
+| training_pairs.csv | 15（仕訳10件） | 57 |
+
+- 紐付け率 10/10（100%）、1明細あたり仕訳1件、複数行仕訳3件（2行×2, 4行×1）、金額一致 10/10
+- 復元テスト: `training_pairs.csv` を読み戻し、元JSONの branches と明細行単位で 10/10 仕訳一致
+- 全行空の列: memo・tags・部門（未使用）、貸方の取引先。借方/貸方の片側が空の明細行あり（一方のみの行）

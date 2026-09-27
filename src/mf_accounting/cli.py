@@ -24,10 +24,11 @@ from .inspect_json import format_summary, summarize, value_counts
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
 from .transform import (
     JOURNAL_LINE_COLUMNS,
+    TRAINING_PAIR_COLUMNS,
     TRANSACTION_COLUMNS,
     flatten,
     journal_lines,
-    transaction_journal_lines,
+    training_pairs,
     transaction_rows,
     write_csv,
 )
@@ -288,13 +289,22 @@ def cmd_inspect(settings: Settings, args) -> None:
     print(format_summary(s, enums))
 
 
+def _dedupe(records: list[dict]) -> list[dict]:
+    seen, out = set(), []
+    for r in records:
+        if r.get("id") not in seen:
+            seen.add(r.get("id"))
+            out.append(r)
+    return out
+
+
 def cmd_csv(settings: Settings, args) -> None:
     office_code = settings.require_office_code()
     out = processed_dir(settings.data_dir, office_code)
-    sources = {}
+    sources: dict = {}
 
     masters = _run_or_latest(settings, office_code, "masters", None)
-    connected = []
+    connected, terms = [], []
     if masters:
         for name, _, key in ep.MASTER_ENDPOINTS:
             f = masters / f"{name}.json"
@@ -305,30 +315,43 @@ def cmd_csv(settings: Settings, args) -> None:
             write_csv(out / f"{name}.csv", rows)
             if name == "connected_accounts":
                 connected = body.get(key) or []
+            if name == "term_settings":
+                terms = body.get(key) or []
         sources["masters"] = str(masters)
 
-    jl_rows, tx_rows = [], []
+    journals: list[dict] = []
     jrun = _run_or_latest(settings, office_code, "journals", args.journals_run)
     if jrun:
-        jl_rows = journal_lines(_load_records(jrun, "journals"))
-        write_csv(out / "journal_lines.csv", jl_rows, JOURNAL_LINE_COLUMNS)
+        journals += _load_records(jrun, "journals")
         sources["journals"] = str(jrun)
+    transactions: list[dict] = []
     trun = _run_or_latest(settings, office_code, "transactions", args.transactions_run)
     if trun:
-        tx_rows = transaction_rows(_load_records(trun, "transactions"), connected)
-        write_csv(out / "transactions.csv", tx_rows, TRANSACTION_COLUMNS)
+        transactions = _load_records(trun, "transactions")
         sources["transactions"] = str(trun)
+        linked = trun / "linked_journals.json"  # linkcheck で明細IDから取得した仕訳
+        if linked.exists():
+            journals += load_json(linked).get("journals") or []
+            sources["linked_journals"] = str(linked)
+    journals = _dedupe(journals)
 
-    stats = {}
-    if jl_rows and tx_rows:
-        joined, stats = transaction_journal_lines(tx_rows, jl_rows)
-        write_csv(out / "transaction_journal_lines.csv", joined)
+    jl_rows = journal_lines(journals, terms)
+    write_csv(out / "journal_lines.csv", jl_rows, JOURNAL_LINE_COLUMNS)
 
-    save_json(out / "manifest.json", {"sources": sources, "journal_lines": len(jl_rows), "transactions": len(tx_rows), "join": stats})
+    linked_counts: dict[str, int] = {}
+    for j in journals:
+        if j.get("transaction_id"):
+            linked_counts[j["transaction_id"]] = linked_counts.get(j["transaction_id"], 0) + 1
+    tx_rows = transaction_rows(transactions, connected, terms, linked_counts)
+    write_csv(out / "transactions.csv", tx_rows, TRANSACTION_COLUMNS)
+
+    pairs, stats = training_pairs(tx_rows, journals, terms)
+    write_csv(out / "training_pairs.csv", pairs, TRAINING_PAIR_COLUMNS)
+
+    save_json(out / "manifest.json", {"sources": sources, "journals": len(journals), "journal_lines": len(jl_rows), "transactions": len(tx_rows), "training_pairs": stats})
     print(f"CSVを出力しました: {out}")
-    print(f"  journal_lines.csv: {len(jl_rows)}行 / transactions.csv: {len(tx_rows)}行")
-    if stats:
-        print(f"  明細→仕訳の結合: {stats}")
+    print(f"  journal_lines.csv: {len(jl_rows)}行（仕訳 {len(journals)}件） / transactions.csv: {len(tx_rows)}行 / training_pairs.csv: {len(pairs)}行")
+    print(f"  明細→仕訳の紐付け: {stats}")
 
 
 # ---- entry ------------------------------------------------------------------

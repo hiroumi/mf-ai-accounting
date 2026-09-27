@@ -100,7 +100,7 @@ mf-ai-accounting/
 
 - `start_date` と `end_date` の差は366日以内 → 365日ごとの区間に分割して取得
 - `per_page` は 10〜500
-- 仕訳側の `transaction_id` で元明細と結合し `transaction_journal_lines.csv` を作成（IDの一致は Step 4 で実データ確認）
+- 仕訳側の `transaction_id` で元明細と結合し `training_pairs.csv` を作成（IDの一致は Step 4 で実データ確認）
 - `POST /transactions/journalize`（仕訳化）は使用しない。ガードでも拒否される
 
 ## CSV形式
