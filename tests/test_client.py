@@ -177,3 +177,19 @@ def test_rate_limit_interval():
 def test_token_provider_repr_hides_key():
     tp = TokenProvider("mf_api_prd_SECRET", GuardedSession())
     assert "SECRET" not in repr(tp)
+
+
+def test_transaction_ids_not_double_encoded():
+    from datetime import date
+
+    from mf_accounting import endpoints as ep
+
+    def handler(req, n):
+        if req.url.endswith("/auth/exchange"):
+            return token_ok(req)
+        assert "transaction_ids=Bow%2B3QQ%3D%3D&transaction_ids=Cow%2F1" in req.url
+        assert "%25" not in req.url
+        return 200, {"journals": [], "metadata": {"total_count": 0, "total_pages": 0}}, None
+
+    client, _, _ = make(handler)
+    ep.journals(client, date(2024, 8, 1), date(2025, 7, 31), per_page=10, transaction_ids=["Bow%2B3QQ%3D%3D", "Cow%2F1"])

@@ -1,6 +1,7 @@
 """会計APIのGETエンドポイント。仕様: https://developers.api-accounting.moneyforward.com/v3/openapi.yaml"""
 
 from datetime import date, timedelta
+from urllib.parse import unquote
 
 from .client import MFAccountingClient
 
@@ -27,15 +28,30 @@ def term_settings(client: MFAccountingClient) -> list[dict]:
     return client.get("/api/v3/term_settings").get("term_settings") or []
 
 
-def journals(client: MFAccountingClient, start_date: date, end_date: date, *, per_page: int, max_items: int | None = None):
-    """仕訳一覧。指定日を含む会計期間の仕訳のみ返るため、会計期間ごとに呼ぶこと。"""
-    return client.get_paginated(
-        "/api/v3/journals",
-        "journals",
-        {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
-        per_page=per_page,
-        max_items=max_items,
-    )
+OPENING_ENTERED_BY = "JOURNAL_TYPE_OPENING"
+TRANSACTION_IDS_MAX = 50  # transaction_ids の最大指定数（仕様）
+
+
+def journals(
+    client: MFAccountingClient,
+    start_date: date,
+    end_date: date,
+    *,
+    per_page: int,
+    max_items: int | None = None,
+    transaction_ids: list[str] | None = None,
+):
+    """仕訳一覧。指定日を含む会計期間の仕訳のみ返るため、会計期間ごとに呼ぶこと。
+
+    transaction_ids を指定すると、その明細から作られた仕訳のみ返る。
+    """
+    params: dict = {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()}
+    if transaction_ids:
+        if len(transaction_ids) > TRANSACTION_IDS_MAX:
+            raise ValueError(f"transaction_ids は {TRANSACTION_IDS_MAX} 件以内で指定してください")
+        # APIのIDはURLエンコード済みの文字列（例: ...%2B...%3D%3D）。requests が再エンコードするため一度デコードする
+        params["transaction_ids"] = [unquote(t) for t in transaction_ids]
+    return client.get_paginated("/api/v3/journals", "journals", params, per_page=per_page, max_items=max_items)
 
 
 def transactions(client: MFAccountingClient, start_date: date, end_date: date, *, per_page: int, max_items: int | None = None):

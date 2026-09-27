@@ -155,11 +155,19 @@ def cmd_journals(settings: Settings, args) -> None:
         return
 
     start, end = _resolve_sample_range(settings, client, args)
-    items, meta = ep.journals(client, start, end, per_page=args.sample, max_items=args.sample)
+    # 開始仕訳を除外する場合は少し多めに1ページ取得して除外後に N 件へ切り詰める
+    fetch_n = args.sample + 5 if args.exclude_opening else args.sample
+    items, meta = ep.journals(client, start, end, per_page=fetch_n, max_items=fetch_n)
+    excluded = 0
+    if args.exclude_opening:
+        kept = [j for j in items if j.get("entered_by") != ep.OPENING_ENTERED_BY]
+        excluded = len(items) - len(kept)
+        items = kept[: args.sample]
+        meta["fetched_count"] = len(items)
     run = new_run_dir(settings.data_dir, office_code, "journals", sample=True)
     save_json(run / f"journals_{start}_{end}.json", {"period": {"start_date": start, "end_date": end}, "metadata": meta, "journals": items})
-    write_manifest(run, office_code=office_code, mode="sample", start_date=start, end_date=end, **meta)
-    print(f"少量取得: 条件 {start}〜{end} / 取得 {len(items)}件 / 条件に合う総件数 {meta['total_count']}件")
+    write_manifest(run, office_code=office_code, mode="sample", start_date=start, end_date=end, excluded_opening=excluded, **meta)
+    print(f"少量取得: 条件 {start}〜{end} / 取得 {len(items)}件（開始仕訳除外 {excluded}件） / 条件に合う総件数 {meta['total_count']}件")
     print(f"保存先: {run}")
 
 
@@ -209,6 +217,37 @@ def _resolve_sample_range(settings: Settings, client: MFAccountingClient, args) 
     return _default_sample_range(_load_terms(settings, client))
 
 
+def cmd_linkcheck(settings: Settings, args) -> None:
+    """明細IDで仕訳を検索し（GET /journals?transaction_ids=...）、紐付けを確認する。値は表示しない。"""
+    office_code = settings.require_office_code()
+    run = _run_or_latest(settings, office_code, "transactions", args.run)
+    if run is None:
+        raise ConfigError("transactions の取得データがありません。")
+    txs = _load_records(run, "transactions")[: ep.TRANSACTION_IDS_MAX]
+    if not txs:
+        raise ConfigError("明細が0件のため確認できません。")
+    manifest = load_json(run / "manifest.json")
+    start, end = date.fromisoformat(manifest["start_date"]), date.fromisoformat(manifest["end_date"])
+    client = make_client(settings, office_code=office_code)
+    items, meta = ep.journals(client, start, end, per_page=100, transaction_ids=[t["id"] for t in txs])
+    save_json(run / "linked_journals.json", {"metadata": meta, "journals": items})
+
+    tx_ids = {t["id"] for t in txs}
+    by_tx: dict[str, int] = {}
+    for j in items:
+        by_tx[j.get("transaction_id")] = by_tx.get(j.get("transaction_id"), 0) + 1
+    print(f"対象明細: {len(txs)}件（{start}〜{end}）")
+    print("明細の仕訳化ステータス: " + ", ".join(f"{k}={v}" for k, v in value_counts(txs, "journalizing_status").items()))
+    print(f"transaction_ids で返った仕訳: {len(items)}件")
+    print(f"  うち transaction_id が対象明細IDと一致: {sum(1 for j in items if j.get('transaction_id') in tx_ids)}件")
+    print(f"  紐付いた明細の数: {len(set(by_tx) & tx_ids)} / {len(txs)}  1明細あたりの仕訳数: {sorted(set(by_tx.values()))}")
+    st = {t["id"]: t.get("journalizing_status") for t in txs}
+    print("  ステータス別の紐付き: " + ", ".join(
+        f"{k}={sum(1 for i in tx_ids if st[i] == k and i in by_tx)}/{sum(1 for i in tx_ids if st[i] == k)}"
+        for k in sorted(set(st.values()), key=str)))
+    print(f"保存先: {run / 'linked_journals.json'}")
+
+
 # ---- inspect / csv ----------------------------------------------------------
 
 
@@ -236,6 +275,11 @@ def cmd_inspect(settings: Settings, args) -> None:
         s = summarize(records, "transaction_date")
         enums = {f: value_counts(records, f) for f in ("journal_type", "entered_by", "is_realized")}
         enums["branches数"] = value_counts([{"n": len(r.get("branches") or [])} for r in records], "n")
+        sides = [side for r in records for b in r.get("branches") or [] for side in (b.get("debitor"), b.get("creditor")) if side]
+        # 税区分名はマスターの区分名であり取引固有の値ではないため表示してよい
+        enums["税区分(tax_name)"] = value_counts([{"t": s.get("tax_name") or "(空)"} for s in sides], "t")
+        enums["invoice_kind"] = value_counts(sides, "invoice_kind")
+        enums["tax_value>0 の借方/貸方"] = value_counts([{"v": (s.get("tax_value") or 0) > 0} for s in sides], "v")
         enums["transaction_idあり"] = value_counts([{"v": bool(r.get("transaction_id"))} for r in records], "v")
     else:
         s = summarize(records, "date")
@@ -308,7 +352,13 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--all", action="store_true", help="全会計期間を取得（Step 6）")
         sp.add_argument("--start", help="少量取得の開始日 YYYY-MM-DD")
         sp.add_argument("--end", help="少量取得の終了日 YYYY-MM-DD")
+        if name == "journals":
+            sp.add_argument("--exclude-opening", action="store_true", help="少量取得で開始仕訳を除外")
         sp.set_defaults(func=func)
+
+    sp = sub.add_parser("linkcheck", help="明細 → transaction_id → 仕訳 の紐付け確認（最新の明細取得分を使用）")
+    sp.add_argument("--run", help="明細の取得ディレクトリ（既定: 最新）")
+    sp.set_defaults(func=cmd_linkcheck)
 
     sp = sub.add_parser("inspect", help="取得済みJSONの構造要約（値は表示しない）")
     sp.add_argument("kind", choices=["journals", "transactions"])

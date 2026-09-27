@@ -87,3 +87,21 @@
 
 - 通常仕訳の概数は「総件数 − 開始仕訳（各期0〜1件）」。APIに仕訳種別の絞り込みがないため厳密値は全件取得時に確定
 - 教師データの年度選定はユーザー判断待ち
+
+### Step 3（再）: FY2024 通常仕訳の少量取得
+
+- `journals --sample 10 --exclude-opening`（GET 1回で15件取得し開始仕訳1件を除外 → 10件保存）。FY2024 総件数 1,160
+- 取引日 2024-08-30〜2024-12-27（APIの返却順は取引日順ではない）
+- `journal_type=journal_entry`, `entered_by=JOURNAL_TYPE_NORMAL`（全件）。branches数 1行:8件 / 2行:2件
+- `transaction_id` あり 10/10、`voucher_file_ids` あり 0/10、`memo` 0/10、`remark` 10/12行、取引先 1/22
+- 税区分は各明細行の借方・貸方ごとに `tax_id` / `tax_name` / `tax_long_name` / `tax_value` と `invoice_kind` で保持
+
+### Step 4: FY2024 連携明細の少量取得と紐付け確認
+
+- `transactions --sample 10`（取引日昇順で最初の10件: 2024-08-01〜08-03）。FY2024 総件数 1,443
+- フィールド: `id, date, value, side, content, memo, journalizing_status, connected_account_id, connected_sub_account_id, voucher_file_ids`
+- 10件とも `side=EXPENSE`, `journalizing_status=registered`
+- 新コマンド `linkcheck`: 明細IDで `GET /journals?transaction_ids=...` を実行 → **10/10 の明細が1件ずつの仕訳に紐付いた**
+  - 取引日一致 10/10、連携口座の補助科目 = 仕訳の口座側補助科目 10/10
+  - 金額: 仕訳の口座側（貸方−借方）= 明細金額 10/10。単純な借方合計では一致しない（税抜経理・複数行仕訳のため）
+- IDはURLエンコード済み文字列（`%2B` 等）で返る。`transaction_ids` 指定時は一度デコードして渡す（二重エンコード防止、テスト追加）
