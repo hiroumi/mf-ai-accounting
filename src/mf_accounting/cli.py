@@ -21,6 +21,7 @@ from .client import MFAccountingClient, MFApiError
 from .config import ConfigError, Settings, load_settings
 from .guard import ForbiddenRequestError, GuardedSession
 from .inspect_json import format_summary, summarize, value_counts
+from . import phase2
 from .quality import format_report, quality_report
 from .validate import DataValidationError, validate_journals, validate_transactions
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
@@ -383,6 +384,116 @@ def cmd_report(settings: Settings, args) -> None:
     print(f"\n保存先: {out / 'quality_report.json'}")
 
 
+def _pct(x) -> str:
+    return "-" if x is None else f"{x * 100:.1f}%"
+
+
+def cmd_analyze(settings: Settings, args) -> None:
+    """Phase 2 準備: 過去データのみでの相手科目推定の評価。件数・率・分布のみ表示する。"""
+    from collections import Counter
+
+    office_code = settings.require_office_code()
+    masters = _run_or_latest(settings, office_code, "masters", None)
+    jrun = _run_or_latest(settings, office_code, "journals", args.journals_run)
+    trun = _run_or_latest(settings, office_code, "transactions", args.transactions_run)
+    if not (masters and jrun and trun):
+        raise ConfigError("masters / journals / transactions の取得データが必要です。")
+    terms = load_json(masters / "term_settings.json").get("term_settings") or []
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    rows, bank_map = phase2.build_labels(_load_records(jrun, "journals"), _load_records(trun, "transactions"), terms, connected)
+    rows = [r for r in rows if r["fiscal_year"] is not None and args.from_fy <= r["fiscal_year"] <= args.to_fy]
+
+    out = processed_dir(settings.data_dir, office_code) / "phase2"
+    write_csv(out / "counter_labels.csv", rows)
+    bank_rows = [
+        {"fiscal_year": k[0], "connected_sub_account_id": k[1], "account_id": v["key"][0] if v["key"] else None,
+         "sub_account_id": v["key"][1] if v["key"] else None, "support": v["support"], "journals": v["journals"], "ratio": round(v["ratio"], 4)}
+        for k, v in sorted(bank_map.by_sub.items(), key=lambda kv: (kv[0][0] or 0, str(kv[0][1])))
+    ]
+    write_csv(out / "bank_account_map.csv", bank_rows)
+    fys = list(range(args.from_fy, args.to_fy + 1))
+    report: dict = {"sources": {"journals": str(jrun), "transactions": str(trun)}}
+
+    # 1. 口座側
+    print("## 1. 口座側の推定")
+    print("| FY | 紐付き明細 | 期×口座の推定 | 期×サービス | 金額から一意 | 現マスター | 未解決 | 口座側純額=明細金額 |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    bank_stats = {}
+    for fy in fys + ["合計"]:
+        rs = rows if fy == "合計" else [r for r in rows if r["fiscal_year"] == fy]
+        m = Counter(r["bank_method"] for r in rs)
+        ok = sum(1 for r in rs if r["bank_amount_matches_tx"])
+        bank_stats[str(fy)] = {"n": len(rs), "methods": dict(m), "amount_match": ok}
+        print(f"| {fy} | {len(rs)} | {m['fy_sub_account_map']} | {m['fy_service_map']} | {m['journal_amount']} | {m['current_master']} | {m['unresolved']} | {ok} ({_pct(ok / len(rs) if rs else None)}) |")
+    diff = [b for b in bank_rows if b["account_id"] and b["support"] >= phase2.MIN_MAP_SUPPORT]
+    master = {c.get("id"): (c.get("account_id"), c.get("sub_account_id")) for a in connected for c in a.get("connected_sub_accounts") or []}
+    n_diff = sum(1 for b in diff if (b["account_id"], b["sub_account_id"]) != master.get(b["connected_sub_account_id"]))
+    print(f"期×口座の推定 {len(diff)}組のうち、現マスターと異なる科目: {n_diff}組")
+    report["bank"] = {"by_fy": bank_stats, "maps": len(diff), "maps_differ_from_master": n_diff}
+
+    # 2. 相手科目
+    labeled = [r for r in rows if r.get("label_account")]
+    cc = Counter(r["counter_count"] for r in labeled)
+    print("\n## 2. 相手科目の抽出")
+    print(f"ラベルあり {len(labeled)}/{len(rows)}件、複合（相手科目2つ以上） {sum(1 for r in labeled if r['complex_journal'])}件"
+          f"（{_pct(sum(1 for r in labeled if r['complex_journal']) / len(labeled))}）、マイナスの相手科目を含む {sum(1 for r in labeled if r['has_negative_counter'])}件")
+    print(f"相手科目数の分布: {dict(sorted(cc.items()))}")
+    print(f"ラベルの種類数: 科目 {len({r['label_account'] for r in labeled})} / 科目+補助科目 {len({r['label_account_sub'] for r in labeled})} / 税区分 {len({r['label_tax'] for r in labeled})}")
+    report["labels"] = {"labeled": len(labeled), "rows": len(rows), "counter_count": dict(cc)}
+
+    # 3. exact content
+    stats = phase2.content_stats(labeled)
+    write_csv(out / "content_stats.csv", [{**s, "labels": s["labels"], "labels_by_fy": s["labels_by_fy"]} for s in stats])
+    n_rows = sum(s["count"] for s in stats)
+    bucket = lambda n: "1回" if n == 1 else "2-4回" if n < 5 else "5-9回" if n < 10 else "10回以上"
+    cb = Counter(bucket(s["count"]) for s in stats)
+    cb_rows = Counter()
+    for s in stats:
+        cb_rows[bucket(s["count"])] += s["count"]
+    multi = [s for s in stats if s["distinct_labels"] > 1]
+    rep = [s for s in stats if s["count"] > 1]
+    tr = Counter("100%" if s["top_ratio"] == 1 else "90-99%" if s["top_ratio"] >= 0.9 else "70-89%" if s["top_ratio"] >= 0.7 else "50-69%" if s["top_ratio"] >= 0.5 else "50%未満" for s in rep)
+    print("\n## 3. exact content 分析（科目レベル, FY%d〜FY%d）" % (args.from_fy, args.to_fy))
+    print(f"content の種類 {len(stats)}（明細 {n_rows}件）")
+    print("出現回数別（種類 / 明細件数）: " + ", ".join(f"{k}: {cb[k]} / {cb_rows[k]}" for k in ("1回", "2-4回", "5-9回", "10回以上")))
+    print(f"複数科目に分類された content: {len(multi)}/{len(rep)}種類（2回以上出現のうち {_pct(len(multi) / len(rep) if rep else None)}）、"
+          f"該当明細 {sum(s['count'] for s in multi)}件（{_pct(sum(s['count'] for s in multi) / n_rows)}）")
+    print("最頻科目の比率（2回以上出現の content）: " + ", ".join(f"{k}={tr[k]}" for k in ("100%", "90-99%", "70-89%", "50-69%", "50%未満")))
+    print(f"直近科目 = 最頻科目: {sum(1 for s in rep if s['latest_label'] == s['top_label'])}/{len(rep)}種類")
+    fy_span = Counter(len(s["labels_by_fy"]) for s in rep)
+    fy_change = sum(1 for s in rep if len(s["labels_by_fy"]) > 1 and len({max(v, key=v.get) for v in s["labels_by_fy"].values()}) > 1)
+    print(f"出現した年度数の分布: {dict(sorted(fy_span.items()))}、年度により最頻科目が変わった content: {fy_change}種類")
+    report["content"] = {"distinct": len(stats), "rows": n_rows, "by_count": dict(cb), "rows_by_count": dict(cb_rows),
+                         "multi_label": len(multi), "repeated": len(rep), "top_ratio": dict(tr), "fy_change": fy_change}
+
+    # 4/5. バックテスト
+    report["backtest"] = {}
+    for label, title in (("label_account", "科目"), ("label_account_sub", "科目+補助科目")):
+        print(f"\n## 4. 時系列バックテスト（exact content, {title}）")
+        print("| 評価年度 | 教師データ | 評価対象 | 過去に同一contentあり | 最頻科目の正解率 | 直近科目の正解率 | 最頻科目の正解率(全体比) |")
+        print("|---|---|---:|---:|---:|---:|---:|")
+        for fy in args.eval_fy:
+            b = phase2.backtest(rows, fy, label)
+            report["backtest"][f"{label}:{fy}"] = b
+            print(f"| FY{fy} | FY{b['train_fys'][0]}〜FY{b['train_fys'][-1]} | {b['test']} | {b['covered']} ({_pct(b['coverage'])}) | "
+                  f"{_pct(b['mode_accuracy_on_covered'])} | {_pct(b['latest_accuracy_on_covered'])} | {_pct(b['mode_correct_of_all_test'])} |")
+
+    print("\n## 5. confidence 候補（過去の同一contentがすべて同じ科目）")
+    for label, title in (("label_account", "科目"), ("label_account_sub", "科目+補助科目")):
+        print(f"\n{title}レベル")
+        print("| 条件 | " + " | ".join(f"FY{fy} 対象件数(比率) / 正解率" for fy in args.eval_fy) + " |")
+        print("|---|" + "---:|" * len(args.eval_fy))
+        for n in (10, 5, 3, 2, 1):
+            cells = []
+            for fy in args.eval_fy:
+                c = report["backtest"][f"{label}:{fy}"]["confidence_unanimous"][f">={n}"]
+                cells.append(f"{c['n']} ({_pct(c['share_of_test'])}) / {_pct(c['accuracy'])}")
+            print(f"| 過去{n}回以上・100%同一 | " + " | ".join(cells) + " |")
+
+    save_json(out / "phase2_report.json", report)
+    print(f"\n派生データ: {out}（counter_labels.csv, bank_account_map.csv, content_stats.csv, phase2_report.json）")
+
+
 # ---- entry ------------------------------------------------------------------
 
 
@@ -423,6 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--journals-run")
     sp.add_argument("--transactions-run")
     sp.set_defaults(func=cmd_report)
+
+    sp = sub.add_parser("analyze", help="Phase 2準備: 過去データのみでの相手科目推定の評価（値は表示しない）")
+    sp.add_argument("--from-fy", type=int, default=2018)
+    sp.add_argument("--to-fy", type=int, default=2024)
+    sp.add_argument("--eval-fy", type=int, nargs="+", default=[2022, 2023, 2024])
+    sp.add_argument("--journals-run")
+    sp.add_argument("--transactions-run")
+    sp.set_defaults(func=cmd_analyze)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
