@@ -865,7 +865,11 @@ def cmd_llm_run(settings: Settings, args) -> None:
 
     # 1. 実際の入力トークン数
     est = [phase4.estimate_tokens(system) + phase4.estimate_tokens(json.dumps(schema)) + phase4.estimate_tokens(i["user_text"]) for i in items]
-    counts = phase4.count_tokens(items, system, schema, args.model, args.effort, approved=args.approve)
+    try:
+        counts = phase4.count_tokens(items, system, schema, args.model, args.effort, approved=args.approve)
+    except phase4.LLMRunError as e:
+        print(f"[停止] {e}（実行はしていません）", file=sys.stderr)
+        raise SystemExit(5)
     save_json(dry / "token_counts.json", {"model": args.model, "counts": counts, "estimates": est})
     print(f"count_tokens: 合計 {sum(counts):,} tokens（1件 平均 {sum(counts) // len(counts):,} / 最小 {min(counts):,} / 最大 {max(counts):,}）、ローカル概算 {sum(est):,}")
     if sum(counts) > 2 * sum(est):
@@ -1047,7 +1051,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)  # URL等の詳細ログを抑制
+    for name in ("urllib3", "httpx", "anthropic"):  # URL等の詳細ログを抑制
+        logging.getLogger(name).setLevel(logging.WARNING)
     try:
         settings = load_settings(args.env_file)
         args.func(settings, args)

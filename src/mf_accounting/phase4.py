@@ -272,14 +272,39 @@ def _request(system: str, schema: dict, user_text: str, model: str, effort: str)
     }
 
 
+def make_client(max_retries: int = 0):
+    """Anthropic クライアント。ワークスペースに紐付かないキーの場合は ANTHROPIC_WORKSPACE_ID をヘッダーで指定する。"""
+    import os
+
+    import anthropic
+
+    ws = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
+    headers = {"anthropic-workspace-id": ws} if ws else None
+    return anthropic.Anthropic(max_retries=max_retries, default_headers=headers)
+
+
 def count_tokens(items: list[dict], system: str, schema: dict, model: str, effort: str, approved: bool) -> list[int]:
     """count_tokens API で実際の入力トークン数を数える（payload は Anthropic に送信される）。"""
     if not approved:
         raise PermissionError("count_tokens も payload を送信するため、承認フラグが必要です（--approve）。")
     import anthropic
 
-    client = anthropic.Anthropic()
-    return [client.messages.count_tokens(**_request(system, schema, it["user_text"], model, effort)).input_tokens for it in items]
+    client = make_client()
+    counts = []
+    for it in items:
+        try:
+            counts.append(client.messages.count_tokens(**_request(system, schema, it["user_text"], model, effort)).input_tokens)
+        except anthropic.APIError as e:
+            raise LLMRunError(f"count_tokens で API エラー: {type(e).__name__} (status={getattr(e, 'status_code', None)}): {_error_message(e)}") from None
+    return counts
+
+
+def _error_message(e) -> str:
+    """API エラーの説明文のみ（リクエスト内容や認証情報は含めない）。"""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        return str((body.get("error") or {}).get("message", ""))[:300]
+    return ""
 
 
 def parse_output(resp, catalog: Catalog) -> dict:
@@ -309,13 +334,13 @@ def run_llm(items: list[dict], system: str, schema: dict, catalog: Catalog, mode
         raise PermissionError("LLM API の呼び出しにはユーザーの承認フラグが必要です（--approve）。")
     import anthropic
 
-    client = anthropic.Anthropic(max_retries=0)  # 自動リトライ・fallback なし。認証情報はログに出さない
+    client = make_client(max_retries=0)  # 自動リトライ・fallback なし。認証情報はログに出さない
     results = []
     for it in items:
         try:
             resp = client.messages.create(max_tokens=4096, **_request(system, schema, it["user_text"], model, effort))
         except anthropic.APIError as e:
-            raise LLMRunError(f"API エラー: {type(e).__name__} (status={getattr(e, 'status_code', None)})") from None
+            raise LLMRunError(f"API エラー: {type(e).__name__} (status={getattr(e, 'status_code', None)}): {_error_message(e)}") from None
         rec = {"transaction_id": it["transaction_id"], "model": resp.model, "stop_reason": resp.stop_reason,
                "usage": {"input": resp.usage.input_tokens, "output": resp.usage.output_tokens,
                          "cache_read": resp.usage.cache_read_input_tokens or 0, "cache_write": resp.usage.cache_creation_input_tokens or 0}}
