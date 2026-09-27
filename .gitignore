@@ -6,7 +6,7 @@
 *.key
 
 # 取得した会計データ（社外秘）
-data/
+data/*
 !data/.gitkeep
 
 # Python

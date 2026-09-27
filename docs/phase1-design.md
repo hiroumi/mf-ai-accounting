@@ -61,41 +61,53 @@
 ```dotenv
 MF_API_KEY=mf_api_prd_xxxxxxxxxxxxxxxx   # 必須
 MF_OFFICE_CODE=XXXX-XXXX                  # 必須
-MF_JOURNALS_START_DATE=                   # 任意（空なら全会計期間）
+MF_JOURNALS_START_DATE=                   # 任意（空なら全会計期間。transactionsにも適用）
 MF_JOURNALS_END_DATE=                     # 任意
-MF_PER_PAGE=1000                          # 任意
+MF_JOURNALS_PER_PAGE=1000                 # 任意（1〜10000）
+MF_TRANSACTIONS_PER_PAGE=500              # 任意（10〜500）
 MF_DATA_DIR=data                          # 任意
 ```
 
-## ディレクトリ構成（案）
+## ディレクトリ構成（実装）
+
+当初案の `scripts/*.py` 個別スクリプトは、Step 1〜6 を順に実行しやすいよう単一CLI（`python -m mf_accounting <command>`）に統合した。pandas は不要になったため依存から外した。
 
 ```
 mf-ai-accounting/
-├── .env.example / .gitignore / README.md
-├── requirements.txt          # requests, python-dotenv, pandas, pytest
+├── .env.example / .gitignore / README.md / pyproject.toml
+├── requirements.txt          # requests, python-dotenv
+├── requirements-dev.txt      # + pytest
 ├── src/mf_accounting/
-│   ├── config.py             # .env読込・検証
-│   ├── auth.py               # APIキー→JWT交換・キャッシュ
-│   ├── client.py             # GET専用クライアント（ガード、レート制限、リトライ、ページング）
-│   ├── endpoints.py          # 各GETエンドポイントのラッパー
-│   ├── storage.py            # JSON保存
-│   └── transform.py          # JSON→CSV変換
+│   ├── guard.py              # 書き込み防止ガード（許可リスト、Session.send で送信前に検査）
+│   ├── config.py             # .env読込・検証（ダミー値検出）
+│   ├── auth.py               # APIキー→JWT交換・キャッシュ（期限5分前に更新）
+│   ├── client.py             # GET専用クライアント（レート制限、リトライ、ページング）
+│   ├── endpoints.py          # 各GETエンドポイント、会計期間・366日分割
+│   ├── storage.py            # JSON保存（manifest付き）
+│   ├── transform.py          # JSON→CSV変換、明細↔仕訳の結合
+│   ├── inspect_json.py       # 値を出さない構造要約・個人情報パターン検出
+│   └── cli.py                # offices / masters / journals / transactions / inspect / csv
 ├── scripts/
-│   ├── check_connection.py   # 事業者情報の取得テスト
-│   ├── fetch_masters.py      # マスターデータ取得
-│   ├── fetch_journals.py     # 仕訳取得（期ごと・全ページ）
-│   └── export_csv.py         # CSV変換
-├── tests/                    # モックで検証（実APIは叩かない）
+│   ├── check_secrets.py      # コミット前の秘密情報チェック
+│   └── pre-commit.sh         # Git pre-commit フック
+├── tests/                    # モックで検証（実APIには接続しない）
 └── data/                     # .gitignore対象
-    ├── raw/{office_code}/{取得日時}/
-    └── processed/
+    ├── raw/{office_code}/{kind}/{日時}[-sample]/
+    └── processed/{office_code}/
 ```
+
+## 連携明細（transactions）の仕様メモ
+
+- `start_date` と `end_date` の差は366日以内 → 365日ごとの区間に分割して取得
+- `per_page` は 10〜500
+- 仕訳側の `transaction_id` で元明細と結合し `transaction_journal_lines.csv` を作成（IDの一致は Step 4 で実データ確認）
+- `POST /transactions/journalize`（仕訳化）は使用しない。ガードでも拒否される
 
 ## CSV形式
 
 仕訳の明細行（branch）1つを1行にする。
 
-- 仕訳単位: `journal_id, number, transaction_date, term_period, journal_type, entered_by, is_realized, memo, tags, remark`
-- 借方: `debit_account_name, debit_sub_account_name, debit_tax_name, debit_value, debit_tax_value, debit_department_name, debit_trade_partner_name, debit_invoice_kind`
+- 仕訳単位: `journal_id, branch_index, number, transaction_date, term_period, journal_type, entered_by, is_realized, memo, tags, remark, transaction_id, voucher_file_count, create_time, update_time`
+- 借方: `debit_account_id/name, debit_sub_account_id/name, debit_tax_id/name/long_name, debit_value, debit_tax_value, debit_department_id/name, debit_trade_partner_code/name, debit_invoice_kind`
 - 貸方: 同項目を `credit_` 付きで
 - 文字コード: UTF-8 BOM付き（Excel互換）
