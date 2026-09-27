@@ -21,6 +21,8 @@ from .client import MFAccountingClient, MFApiError
 from .config import ConfigError, Settings, load_settings
 from .guard import ForbiddenRequestError, GuardedSession
 from .inspect_json import format_summary, summarize, value_counts
+from .quality import format_report, quality_report
+from .validate import DataValidationError, validate_journals, validate_transactions
 from .storage import latest_run_dir, load_json, new_run_dir, processed_dir, save_json, write_manifest
 from .transform import (
     JOURNAL_LINE_COLUMNS,
@@ -143,15 +145,18 @@ def cmd_journals(settings: Settings, args) -> None:
         periods = ep.periods_from_term_settings(terms, settings.journals_start_date, settings.journals_end_date)
         run = new_run_dir(settings.data_dir, office_code, "journals")
         summary = []
-        for p in periods:
-            items, meta = ep.journals(client, p["start_date"], p["end_date"], per_page=settings.journals_per_page)
-            fname = f"journals_{p['start_date']}_{p['end_date']}.json"
-            save_json(run / fname, {"period": p, "metadata": meta, "journals": items})
-            summary.append({"file": fname, **{k: str(v) for k, v in p.items()}, **meta})
-            print(f"  {p['start_date']}〜{p['end_date']}: {len(items)}件 (total_count={meta['total_count']})")
-            if meta["truncated"]:
-                logger.warning("取得件数が total_count より少ないです: %s", fname)
-        write_manifest(run, office_code=office_code, mode="all", periods=summary)
+        try:
+            for p in periods:
+                items, meta = ep.journals(client, p["start_date"], p["end_date"], per_page=settings.journals_per_page)
+                fname = f"journals_{p['start_date']}_{p['end_date']}.json"
+                save_json(run / fname, {"period": p, "metadata": meta, "journals": items})
+                validate_journals(items, meta, p["start_date"], p["end_date"])
+                summary.append({"file": fname, **{k: str(v) for k, v in p.items()}, **meta})
+                print(f"  FY{p['fiscal_year']} {p['start_date']}〜{p['end_date']}: {len(items)}件 (total_count={meta['total_count']}, pages={meta['pages_fetched']})")
+        except Exception as e:
+            write_manifest(run, office_code=office_code, mode="all", status="failed", error=str(e), periods=summary)
+            raise
+        write_manifest(run, office_code=office_code, mode="all", status="complete", periods=summary)
         print(f"合計 {sum(s['fetched_count'] for s in summary)}件  保存先: {run}")
         return
 
@@ -184,17 +189,22 @@ def cmd_transactions(settings: Settings, args) -> None:
         periods = ep.periods_from_term_settings(terms, settings.journals_start_date, settings.journals_end_date)
         if not periods:
             raise ConfigError("取得対象の会計期間がありません。")
-        start = periods[0]["start_date"]
-        end = min(periods[-1]["end_date"], date.today())
         run = new_run_dir(settings.data_dir, office_code, "transactions")
         summary = []
-        for w_start, w_end in ep.split_date_range(start, end):
-            items, meta = ep.transactions(client, w_start, w_end, per_page=settings.transactions_per_page)
-            fname = f"transactions_{w_start}_{w_end}.json"
-            save_json(run / fname, {"period": {"start_date": w_start, "end_date": w_end}, "metadata": meta, "transactions": items})
-            summary.append({"file": fname, "start_date": str(w_start), "end_date": str(w_end), **meta})
-            print(f"  {w_start}〜{w_end}: {len(items)}件 (total_count={meta['total_count']})")
-        write_manifest(run, office_code=office_code, mode="all", windows=summary)
+        try:
+            # 会計期間ごと（各期は366日以内）に取得し、年度別に集計しやすくする
+            for p in periods:
+                for w_start, w_end in ep.split_date_range(p["start_date"], min(p["end_date"], date.today())):
+                    items, meta = ep.transactions(client, w_start, w_end, per_page=settings.transactions_per_page)
+                    fname = f"transactions_{w_start}_{w_end}.json"
+                    save_json(run / fname, {"period": {"start_date": w_start, "end_date": w_end}, "metadata": meta, "transactions": items})
+                    validate_transactions(items, meta, w_start, w_end)
+                    summary.append({"file": fname, "fiscal_year": p["fiscal_year"], "start_date": str(w_start), "end_date": str(w_end), **meta})
+                    print(f"  FY{p['fiscal_year']} {w_start}〜{w_end}: {len(items)}件 (total_count={meta['total_count']}, pages={meta['pages_fetched']})")
+        except Exception as e:
+            write_manifest(run, office_code=office_code, mode="all", status="failed", error=str(e), windows=summary)
+            raise
+        write_manifest(run, office_code=office_code, mode="all", status="complete", windows=summary)
         print(f"合計 {sum(s['fetched_count'] for s in summary)}件  保存先: {run}")
         return
 
@@ -354,6 +364,25 @@ def cmd_csv(settings: Settings, args) -> None:
     print(f"  明細→仕訳の紐付け: {stats}")
 
 
+def cmd_report(settings: Settings, args) -> None:
+    """年度別・全体の品質集計（件数・率のみ。値は表示しない）。"""
+    office_code = settings.require_office_code()
+    masters = _run_or_latest(settings, office_code, "masters", None)
+    jrun = _run_or_latest(settings, office_code, "journals", args.journals_run)
+    trun = _run_or_latest(settings, office_code, "transactions", args.transactions_run)
+    if not (masters and jrun and trun):
+        raise ConfigError("masters / journals / transactions の取得データが必要です。")
+    terms = load_json(masters / "term_settings.json").get("term_settings") or []
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    fys = list(range(args.from_fy, args.to_fy + 1))
+    report = quality_report(_load_records(jrun, "journals"), _load_records(trun, "transactions"), terms, connected, fys)
+    out = processed_dir(settings.data_dir, office_code)
+    save_json(out / "quality_report.json", {"sources": {"journals": str(jrun), "transactions": str(trun)}, **report})
+    print(f"仕訳: {jrun}\n明細: {trun}\n")
+    print(format_report(report))
+    print(f"\n保存先: {out / 'quality_report.json'}")
+
+
 # ---- entry ------------------------------------------------------------------
 
 
@@ -388,6 +417,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--run", help="対象の取得ディレクトリ（既定: 最新）")
     sp.set_defaults(func=cmd_inspect)
 
+    sp = sub.add_parser("report", help="年度別の品質集計（値は表示しない）")
+    sp.add_argument("--from-fy", type=int, default=2018)
+    sp.add_argument("--to-fy", type=int, default=2024)
+    sp.add_argument("--journals-run")
+    sp.add_argument("--transactions-run")
+    sp.set_defaults(func=cmd_report)
+
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
     sp.add_argument("--transactions-run", help="明細の取得ディレクトリ（既定: 最新）")
@@ -402,6 +438,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings(args.env_file)
         args.func(settings, args)
+    except DataValidationError as e:
+        print(f"[停止] 想定外のデータを検出したため処理を停止しました: {e}", file=sys.stderr)
+        return 3
     except ForbiddenRequestError as e:
         print(f"[ブロック] 書き込み防止ガードがリクエストを停止しました: {e}", file=sys.stderr)
         return 2

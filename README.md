@@ -39,9 +39,11 @@ mf transactions --sample 10      # Step 4: 連携明細を少量取得
 mf linkcheck                     #         明細 → transaction_id → 仕訳 の紐付け確認
 mf inspect transactions
 mf csv                           # Step 5: CSV変換
-mf journals --all                # Step 6: 全会計期間を取得
-mf transactions --all
+# Step 6: 期間を指定して全件取得（.env の MF_JOURNALS_START_DATE / END_DATE でも可）
+MF_JOURNALS_START_DATE=2018-08-01 MF_JOURNALS_END_DATE=2025-07-31 mf journals --all
+MF_JOURNALS_START_DATE=2018-08-01 MF_JOURNALS_END_DATE=2025-07-31 mf transactions --all
 mf csv
+mf report                        # 年度別の品質集計（値は表示しない）
 ```
 
 `--start YYYY-MM-DD --end YYYY-MM-DD` で少量取得の期間を指定できます。

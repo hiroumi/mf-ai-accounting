@@ -23,8 +23,19 @@ def latest_run_dir(data_dir: Path, office_code: str, kind: str) -> Path | None:
     base = data_dir / "raw" / office_code / kind
     if not base.is_dir():
         return None
-    runs = sorted(p for p in base.iterdir() if p.is_dir())
-    return runs[-1] if runs else None
+    runs = sorted((p for p in base.iterdir() if p.is_dir() and _run_ok(p)), reverse=True)
+    return runs[0] if runs else None
+
+
+def _run_ok(run: Path) -> bool:
+    """manifest があり、失敗として記録されていない取得ディレクトリのみ対象にする。"""
+    m = run / "manifest.json"
+    if not m.exists():
+        return False
+    try:
+        return load_json(m).get("status") != "failed"
+    except ValueError:
+        return False
 
 
 def processed_dir(data_dir: Path, office_code: str) -> Path:
