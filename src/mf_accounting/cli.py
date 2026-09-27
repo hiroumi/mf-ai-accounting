@@ -1051,7 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
-    for name in ("urllib3", "httpx", "anthropic"):  # URL等の詳細ログを抑制
+    for name in ("urllib3", "httpx", "httpx2", "anthropic"):  # URL等の詳細ログを抑制
         logging.getLogger(name).setLevel(logging.WARNING)
     try:
         settings = load_settings(args.env_file)
