@@ -96,3 +96,11 @@
 - 過去履歴だけで高 confidence にできる候補は「exact 一致・過去3回以上・主科目一致率100%・最終利用365日以内」（各年 97〜99%, coverage 約3割）
 - fuzzy は単独では高 confidence にしない。使う場合も「類似度≥90・top3の主科目一致・履歴一致率100%」程度に限定し、件数は僅少
 - FY2022 は exact でも主科目 accuracy 67% と低い（過去履歴の多い content ほど外れる傾向）。年度ごとの記帳慣行の違いに注意
+
+## 次Phase以降の案: reason_category を structured output に追加（2026-09-27 記録, 未実装）
+
+- 現状の reason はキーワード分類で、過去候補を常に提示するため「過去履歴」がほぼ全件に該当し識別力がない
+- 案: 出力スキーマに `reason_category`（enum）を追加し、主たる根拠を1つ選ばせる
+  - 候補: `past_same_counterparty`（同一取引先の過去履歴）/ `past_similar_transaction`（類似取引）/ `content_semantics`（摘要の意味）/ `amount_or_direction`（金額・入出金方向）/ `insufficient_information`（情報不足）
+  - 必要に応じて `secondary_reason_category` も
+- 追加するとスキーマ・プロンプトが変わるため、比較する場合は新しいベースラインとして同一サンプルで再評価すること

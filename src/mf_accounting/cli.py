@@ -926,6 +926,45 @@ def cmd_llm_tokens(settings: Settings, args) -> None:
     print(f"\n保存先: {dry / 'token_breakdown.json'}")
 
 
+def cmd_llm_compare(settings: Settings, args) -> None:
+    """2モデルの結果を同一サンプルで比較する（件数・率のみ表示）。"""
+    office_code = settings.require_office_code()
+    dry = processed_dir(settings.data_dir, office_code) / "phase4" / "dry_run"
+    def load(name):
+        return {r["transaction_id"]: (r.get("output") or {}) for r in (json.loads(l) for l in (dry / name).read_text(encoding="utf-8").splitlines() if l.strip())}
+    a_res, b_res = load(args.a), load(args.b)
+    ans = [json.loads(l) for l in (dry / "answers_not_sent.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    A, B = args.a_label, args.b_label
+    rows = []
+    for x in ans:
+        a, b = a_res[x["transaction_id"]], b_res[x["transaction_id"]]
+        act = x["actual_primary_account_id"]
+        rows.append({"a": a.get("primary_account_id"), "b": b.get("primary_account_id"), "ac": a.get("confidence") or 0.0, "bc": b.get("confidence") or 0.0,
+                     "ar": a.get("needs_review"), "br": b.get("needs_review"), "a_ok": a.get("primary_account_id") == act, "b_ok": b.get("primary_account_id") == act})
+    n = len(rows)
+    def cov(sel, ok):
+        rs = [r for r in rows if sel(r)]
+        k = sum(1 for r in rs if ok(r))
+        return f"{len(rs)}/{n} ({_pct(len(rs) / n)}) / {_pct(k / len(rs) if rs else None)}"
+    g = Counter((r["a_ok"], r["b_ok"]) for r in rows)
+    print(f"## {A} vs {B}（同一 {n}件）")
+    print(f"- 両方正解 {g[(True, True)]} / {A}だけ正解 {g[(True, False)]} / {B}だけ正解 {g[(False, True)]} / 両方不正解 {g[(False, False)]}")
+    same = [r for r in rows if r["a"] and r["a"] == r["b"]]
+    print(f"- 同じ科目を選択: {len(same)}件, accuracy {_pct(sum(r['a_ok'] for r in same) / len(same) if same else None)} / 異なる科目: {n - len(same)}件"
+          f"（うち {A}正解 {sum(r['a_ok'] for r in rows if r not in same)} / {B}正解 {sum(r['b_ok'] for r in rows if r not in same)}）")
+    print(f"- 両方 confidence>=0.70 かつ同じ科目: coverage / accuracy = {cov(lambda r: r['ac'] >= 0.7 and r['bc'] >= 0.7 and r['a'] == r['b'] and r['a'], lambda r: r['a_ok'])}")
+    print("\n## confidence calibration（coverage / accuracy）")
+    print(f"| 条件 | {A} | {B} |\n|---|---:|---:|")
+    for t in (0.7, 0.8, 0.9):
+        print(f"| confidence >= {t:.2f} | {cov(lambda r: r['ac'] >= t, lambda r: r['a_ok'])} | {cov(lambda r: r['bc'] >= t, lambda r: r['b_ok'])} |")
+    print(f"| needs_review = false | {cov(lambda r: r['ar'] is False, lambda r: r['a_ok'])} | {cov(lambda r: r['br'] is False, lambda r: r['b_ok'])} |")
+    print("\n## ensemble 候補（coverage / accuracy）")
+    print(f"- A: {A}>=0.70 AND {B}>=0.70 AND 同じ科目: {cov(lambda r: r['ac'] >= 0.7 and r['bc'] >= 0.7 and r['a'] == r['b'] and r['a'], lambda r: r['a_ok'])}")
+    print(f"- B: {B}>=0.70 のみ: {cov(lambda r: r['bc'] >= 0.7, lambda r: r['b_ok'])}")
+    print(f"- C: {A}>=0.70 のみ: {cov(lambda r: r['ac'] >= 0.7, lambda r: r['a_ok'])}")
+    save_json(dry / f"compare_{args.a_label}_vs_{args.b_label}.json", {"agreement": dict((f"{k[0]}_{k[1]}", v) for k, v in g.items()), "n": n})
+
+
 def cmd_llm_eval(settings: Settings, args) -> None:
     """LLM 結果を正解（送信していないファイル）と照合する。件数・率のみ表示し、reason の本文は表示しない。"""
     office_code = settings.require_office_code()
@@ -1067,6 +1106,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--models", nargs="+", default=["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"])
     sp.add_argument("--approve", action="store_true")
     sp.set_defaults(func=cmd_llm_tokens)
+
+    sp = sub.add_parser("llm-compare", help="Phase 4: 2モデルの結果を同一サンプルで比較（値は表示しない）")
+    sp.add_argument("--a", required=True)
+    sp.add_argument("--b", required=True)
+    sp.add_argument("--a-label", default="Opus")
+    sp.add_argument("--b-label", default="Sonnet")
+    sp.set_defaults(func=cmd_llm_compare)
 
     sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
     sp.add_argument("--results", required=True, help="dry_run 内の results_*.jsonl")

@@ -329,3 +329,22 @@ LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `l
 - ルール比較: LLMのみ正解 10 / ルールのみ正解 1 / 両方正解 23 / 両方不正解 6
 - API 実績: input 44,538 / cache write 6,145 / cache read 239,655 / output 4,945 tokens（出力 平均約124 tokens/件 → 思考トークンはほぼなし）。推定 $0.50
 - reason のキーワード分類は「過去履歴」が39/40件に該当し識別力が低い（プロンプトが過去候補を必ず提示するため）
+
+### Phase 4: Sonnet 5 の同一40件評価と Opus 5 との比較（2026-09-27）
+
+条件は Opus と同一（claude-sonnet-5 / effort medium / caching ON / fallback OFF / 同一 payload・system・スキーマ。入力ファイルのハッシュで同一性を確認）。Opus の回答は渡していない。エラー0件。`mf llm-compare` を追加。
+
+| 指標 | Opus 5 | Sonnet 5 |
+|---|---:|---:|
+| accuracy（40件） | 82.5% | **87.5%** |
+| A / B / C / D | 70 / 70 / 100 / 90% | 80 / 80 / 100 / 90% |
+| simple / complex | 85.0 / 80.0% | 85.0 / 90.0% |
+| 平均 confidence | 0.76 | 0.74 |
+| needs_review / insufficient | 12 / 0 | 13 / 6 |
+| confidence>=0.70 coverage / accuracy | 72.5% / 100% | 67.5% / 100% |
+| confidence<0.70 の accuracy | 36.4%（11件） | 61.5%（13件） |
+| API 実績（input / cache write / read / output） | 44,538 / 6,145 / 239,655 / 4,945 | 44,538 / 6,145 / 239,655 / 4,426 |
+| 推定コスト | $0.50 | $0.20 |
+
+- 一致: 両方正解 33 / Opusだけ 0 / Sonnetだけ 2 / 両方不正解 5。同じ科目を選んだ 36件の accuracy 91.7%
+- ensemble 候補: 両方>=0.70かつ同一科目 67.5% / 100%、Sonnet>=0.70 のみ 67.5% / 100%、Opus>=0.70 のみ 72.5% / 100%
