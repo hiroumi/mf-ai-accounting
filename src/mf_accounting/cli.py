@@ -789,7 +789,7 @@ def cmd_llm_prepare(settings: Settings, args) -> None:
     high = [t for t in enriched if t["high_confidence"]]
     targets = [t for t in enriched if t["llm_target"]]
     other = [t for t in enriched if not t["high_confidence"] and not t["llm_target"]]
-    if args.all:  # 実運用パイプライン: 高confidence群以外はすべて LLM へ
+    if args.all and not args.exclude_e:  # 実運用パイプライン: 高confidence群以外はすべて LLM へ
         targets = [t for t in enriched if not t["high_confidence"]]
     cat_counts = Counter(c for t in targets for c in t["categories"])
     unreachable = sum(1 for t in targets if t["actual"] not in catalog.id_to_code)
@@ -797,7 +797,7 @@ def cmd_llm_prepare(settings: Settings, args) -> None:
     print(f"## 1. FY{target_fy} の対象選定（{len(enriched)}件）")
     print(f"- 高confidence群（LLM対象外）: {len(high)}件 — exact・過去3回以上・主科目一致率100%・最終利用365日以内")
     print(f"- LLM対象: {len(targets)}件（カテゴリ重複あり）: " + ", ".join(f"{k}={v}" for k, v in sorted(cat_counts.items())))
-    print(f"- その他（E: exact・過去1〜2回で一致）: {len(other)}件" + ("（--all のため LLM対象に含める）" if args.all else "（LLM対象外・ルールで推定）"))
+    print(f"- その他（E: exact・過去1〜2回で一致）: {len(other)}件" + ("（--all のため LLM対象に含める）" if args.all and not args.exclude_e else "（LLM対象外・人間確認候補）"))
     sig = Counter("+".join(c[0] for c in t["categories"]) for t in targets)
     print("- 条件の組み合わせ（重複を考慮）: " + ", ".join(f"{k}={v}" for k, v in sorted(sig.items())))
     print(f"- LLM対象のうち、正解の主科目が現在利用不可（選択肢にない）: {unreachable}件")
@@ -1238,6 +1238,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--target-fy", type=int, default=2024)
     sp.add_argument("--sample", type=int, default=40)
     sp.add_argument("--all", action="store_true", help="高confidence群以外のすべてを対象にする（実運用パイプライン評価）")
+    sp.add_argument("--exclude-e", action="store_true", help="--all でも E（exact・過去1〜2回）は LLM に送らない（A〜D の全件）")
     sp.add_argument("--name", default="dry_run", help="出力サブディレクトリ名")
     sp.add_argument("--reason-category", action="store_true", help="structured output に reason_category を追加")
     sp.set_defaults(func=cmd_llm_prepare)
