@@ -399,3 +399,53 @@ LLM API は未呼び出し。MF への書き込みなし。`mf llm-prepare` / `l
 
 - accuracy>=98%: 最大 coverage 49.1%（Balanced）。accuracy>=99%: シンプルな条件では達成不可（ルール群自体が 98.7%）
 - 注意: 高confidence群で口座が初めての12件は LLM 未送信のため人間扱いで試算
+
+## Phase 4.5: FY2023 での検証（固定ルーティング3案, Sonnet 5, 2026-09-28）
+
+FY2024 で得た判断基準が別年度でも再現するかを確認した。FY2023 の正解を見て条件・閾値は調整していない。
+
+### 実行条件
+- 評価母集団: FY2023 885件（FY2024 と同じローリング評価。各取引日より前の履歴のみ）= 高confidenceルール 324 + E層 125 + Sonnet 対象 436
+- E層（exact・過去1〜2回・一致率100%・365日以内）は LLM に送らず人間確認。`mf llm-prepare --target-fy 2023 --all --exclude-e --reason-category --name fy2023_oos`
+- **FY2024 と同一の prompt / schema / account catalog**（ハッシュ一致で確認）。正解ラベル・ID は LLM 入力に含めない（送信前チェック 0件）
+- 評価条件は Sonnet 実行前に `phase4/fy2023_oos/preregistered_plans.json` に固定し、**実行前後で変更なし**（ハッシュ一致で確認）
+- claude-sonnet-5 / effort medium / caching ON / **fallback なし** / コスト上限 $10 / **MF write なし**
+- **436件を完走**。API timeout（APITimeoutError）が3回発生したが、いずれも既存の安全設計どおり停止し、`--resume` で再開して正常完了（最終的なエラー 0, stop_reason はすべて end_turn）
+- **推定 API コスト $2.12**（usage から計算。timeout した要求と再開時の cache write は usage に含まれないため、実請求はわずかに上回る可能性あり）
+- 既存の LLM 結果（FY2024）と FY2023 の明細の重複は 0件で、再利用可能な結果はなかった
+
+### Sonnet の結果（A〜D, FY2024 は E を除外して比較）
+
+| 指標 | FY2023（436件） | FY2024（606件） |
+|---|---:|---:|
+| overall accuracy | 72.5% | 85.0% |
+| A / B / C / D | 62.0 / 68.2 / 87.3 / 82.1% | 69.8 / 84.9 / 93.0 / 85.7% |
+| conf>=0.70 件数 / accuracy | 198 / 88.9% | 397 / 95.2% |
+| conf>=0.80 件数 / accuracy | 124 / 91.9% | 321 / 96.6% |
+| **conf>=0.90 件数 / accuracy** | **55 / 98.2%**（誤り1） | **179 / 97.8%**（誤り4） |
+| **conf>=0.95 件数 / accuracy** | **14 / 100%** | **66 / 98.5%** |
+| needs_review=false | 214 / 88.3% | 405 / 94.1% |
+| insufficient_information=true | 37 / 32.4% | 31 / 45.2% |
+
+- conf>=0.90 / 0.95 の行は needs_review=false・insufficient=false を加えても件数は同じ
+- E層の除外で両年度とも automated accuracy が改善（Baseline で E をルール自動にした場合との比較: FY2023 96.4% → 97.9%, FY2024 95.1% → 97.4%）
+
+### 固定ルーティング3案（E層・その他は人間確認。Sonnet は needs_review=false・insufficient=false が必要）
+
+| 案 | 条件 | FY2023 coverage / accuracy | FY2024 coverage / accuracy |
+|---|---|---:|---:|
+| Baseline | 高confidenceルール + Sonnet conf>=0.90 | 42.8% / 97.9% | 48.2% / 97.4% |
+| **Balanced** | 高confidenceルール（口座が過去履歴にある場合のみ）+ Sonnet conf>=0.90 | 39.4% / **98.3%** | 47.1% / **98.4%** |
+| Conservative | 高confidenceルール（口座が過去履歴にある場合のみ）+ Sonnet conf>=0.95 | 34.8% / 98.4% | 36.2% / 98.7% |
+
+### 注意点
+- **connected account 条件は FY2023 の結果も見て採用しているため、この条件については厳密な out-of-sample 検証ではない**
+- 一方、Sonnet の confidence 閾値・E層除外・同一 prompt での再現性は FY2023 で検証できた
+- FY2023 では Sonnet 全体の accuracy は低下したが、high-confidence 帯の accuracy は維持され、high-confidence の件数自体が減った（conf>=0.90 の coverage 29.5% → 12.6%）
+- confidence が abstention / human-review routing のシグナルとして機能している可能性が高い
+- FY2023 の conf>=0.90 は55件・conf>=0.95 は14件と少なく、誤り1件で率が大きく動く規模である
+- FY2023 の自動判定の大部分はルール側（Sonnet の追加は 14〜55件）
+
+### 暫定方針
+- **Balanced を今後の実運用設計の基準候補とする**（production の確定ルールではない）
+- 次の検証候補: FY2022、および FY2026 以降の新規データ（実運用に最も近い将来データ）
