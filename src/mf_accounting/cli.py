@@ -863,6 +863,149 @@ def cmd_llm_prepare(settings: Settings, args) -> None:
     print("  system_prompt.txt / output_schema.json / payloads.jsonl（送信予定の内容）/ answers_not_sent.jsonl（正解, 送信しない）")
 
 
+def _close_context(settings: Settings, fy: int):
+    """決算処理用: 過去年度の履歴（仕訳紐付き）と、対象年度の明細・マスター（data/fy{fy}_close/raw）。"""
+    office_code = settings.require_office_code()
+    rows, accounts, out = _phase4_context(settings)
+    history = [r for r in rows if r["fiscal_year"] < fy and r.get("tx_content") and r.get("primary_account_id")]
+    close_dir = settings.data_dir / f"fy{fy}_close"
+    masters = latest_run_dir(close_dir, office_code, "masters")
+    trun = latest_run_dir(close_dir, office_code, "transactions")
+    if masters is None or trun is None:
+        raise ConfigError(f"{close_dir} に masters / transactions の取得データがありません。")
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    fy_accounts = load_json(masters / "accounts.json").get("accounts") or []
+    if phase4.Catalog.from_accounts(fy_accounts).code_to_id != phase4.Catalog.from_accounts(accounts).code_to_id:
+        raise ConfigError("対象年度の勘定科目マスターが FY2023/FY2024 検証時と異なります（catalog 不一致）。")
+    return history, accounts, connected, _load_records(trun, "transactions"), out / f"fy{fy}_close", close_dir, trun
+
+
+def cmd_close_prepare(settings: Settings, args) -> None:
+    """決算処理: 対象抽出・楽天カード系統統合・Amazon 除外・層分け・Sonnet payload 作成（LLM API は呼ばない）。"""
+    from . import close
+    fy = args.fy
+    history, accounts, connected, txs, dry, close_dir, trun = _close_context(settings, fy)
+    by_id = {a["id"]: a for a in accounts}
+    sub = {s["id"]: (a, s) for a in connected for s in a.get("connected_sub_accounts") or []}
+    is_card = lambda sid: (by_id.get((sub.get(sid) or ({}, {}))[1].get("account_id")) or {}).get("account_group") == "LIABILITY"
+    lineage = close.lineage_map(connected)
+
+    amazon_linked, amazon_dup, targets = [], [], []
+    for t in txs:
+        a, _ = sub.get(t.get("connected_sub_account_id")) or ({}, {})
+        r = {"transaction_id": t["id"], "tx_date": t["date"], "tx_content": (t.get("content") or "").strip(), "tx_value": t.get("value"),
+             "tx_side": t.get("side"), "connected_sub_account_id": t.get("connected_sub_account_id"),
+             "bank_account_id": (sub.get(t.get("connected_sub_account_id")) or ({}, {}))[1].get("account_id")}
+        if a.get("name") == close.AMAZON_CONNECTED_ACCOUNT:
+            amazon_linked.append(r)
+        elif close.is_amazon_dup(r["tx_content"], is_card(r["connected_sub_account_id"])):
+            amazon_dup.append(r)
+        else:
+            targets.append(r)
+    items = close.classify(targets, history, lineage)
+    sonnet = sorted((i for i in items if i["routing"] == "sonnet"), key=lambda i: (i["tx_date"], i["transaction_id"]))
+
+    catalog = phase4.Catalog.from_accounts(accounts, available_only=True)
+    names = {a["id"]: a.get("name") for a in accounts}
+    ordered = phase4.build_candidate_index(history)
+    system = phase4.system_text(catalog, True)
+    schema = phase4.output_schema(catalog, True)
+    payloads = []
+    for t in sonnet:
+        cands = phase4.candidates_before(ordered, t["tx_date"], t["tx_content"], catalog.id_to_code, names)
+        payload = phase4.build_payload(t, cands, _account_kind(t["bank_account_id"], by_id))
+        payloads.append({"transaction_id": t["transaction_id"], "categories": [t["layer"]], "payload": payload, "user_text": phase4.user_text(payload)})
+
+    dry.mkdir(parents=True, exist_ok=True)
+    (dry / "system_prompt.txt").write_text(system, encoding="utf-8")
+    save_json(dry / "output_schema.json", schema)
+    save_json(dry / "catalog.json", {"code_to_id": catalog.code_to_id})
+    (dry / "payloads.jsonl").write_text("\n".join(json.dumps(i, ensure_ascii=False) for i in payloads) + "\n", encoding="utf-8")
+    save_json(dry / "items.json", items)
+    save_json(dry / "amazon_dup.json", amazon_dup)
+    save_json(dry / "amazon_linked.json", amazon_linked)
+
+    layers = Counter(i["layer"] for i in items)
+    counts = {
+        "fiscal_year": fy, "transactions_run": str(trun), "history_fiscal_years": sorted({r["fiscal_year"] for r in history}),
+        "history_rows": len(history), "transactions": len(txs), "amazon_linked": len(amazon_linked), "amazon_dup_candidates": len(amazon_dup),
+        "ai_targets": len(items), "layers": dict(sorted(layers.items())),
+        "rule_candidates": sum(1 for i in items if i["routing"] == close.RULE_CANDIDATE),
+        "high_confidence_unseen_account": sum(1 for i in items if i["high_confidence"] and i["routing"] == close.HUMAN),
+        "sonnet_targets": len(sonnet), "e_layer_human": layers["E"],
+        "unseen_account_after_lineage": sum(1 for i in items if i["account_seen"] is False),
+        "conditions": {"account_lineages": close.ACCOUNT_LINEAGES,
+                       "lineage_sub_accounts": {k: sorted(s for s, v in lineage.items() if v == f"lineage:{k}") for k in close.ACCOUNT_LINEAGES},
+                       "amazon_connected_account": close.AMAZON_CONNECTED_ACCOUNT, "amazon_dup_keywords": close.AMAZON_DUP_KEYWORDS,
+                       "amazon_dup_exclude": close.AMAZON_DUP_EXCLUDE, "amazon_dup_scope": "card (LIABILITY) accounts only",
+                       "sonnet_layers": close.SONNET_LAYERS, "sonnet_min_conf": close.SONNET_MIN_CONF,
+                       "rule": "high_confidence AND account_seen(lineage)", "plan": "Balanced (FY2023 preregistered)"},
+    }
+    save_json(dry / "counts.json", counts)
+    save_json(close_dir / "counts.json", counts)
+    print(json.dumps({k: v for k, v in counts.items() if k != "conditions"}, ensure_ascii=False, indent=1))
+    # 送信前チェック（値は表示しない）
+    import re as _re
+    blob = "\n".join(i["user_text"] for i in payloads)
+    print(f"送信前チェック: 7桁以上の数字={len(_re.findall(r'[0-9]{7,}', blob))} メール={len(phase4._EMAIL.findall(blob))} 電話={len(phase4._PHONE.findall(blob))} "
+          f"明細ID={sum(1 for i in payloads if i['transaction_id'] in i['user_text'])}")
+    print(f"保存先: {dry}")
+
+
+def cmd_close_review(settings: Settings, args) -> None:
+    """決算処理: Sonnet 結果と合わせて review_ai.csv / review_amazon_dup.csv を生成する（MF write なし）。"""
+    from . import close
+    fy = args.fy
+    office_code = settings.require_office_code()
+    _, accounts, out = _phase4_context(settings)
+    dry = out / f"fy{fy}_close"
+    close_dir = settings.data_dir / f"fy{fy}_close"
+    masters = latest_run_dir(close_dir, office_code, "masters")
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    subnames = {s["id"]: f"{a['name']} / {s['name']}" for a in connected for s in a.get("connected_sub_accounts") or []}
+    names = {a["id"]: a.get("name") for a in accounts}
+    items = load_json(dry / "items.json")
+    path = dry / args.results
+    results = {r["transaction_id"]: r for r in (json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip())} if path.exists() else {}
+    missing = [i for i in items if i["routing"] == "sonnet" and i["transaction_id"] not in results]
+    if missing:
+        raise ConfigError(f"Sonnet 結果が {len(missing)}件 不足しています（llm-run --resume で完了させてください）。")
+    rows = close.review_rows(items, results, names, subnames)
+    review = close_dir / "review"
+    write_csv(review / "review_ai.csv", rows, close.REVIEW_AI_COLUMNS)
+
+    linked = load_json(dry / "amazon_linked.json")
+    dist = lambda a, b: abs((date.fromisoformat(a) - date.fromisoformat(b)).days)
+    dup = []
+    for r in sorted(load_json(dry / "amazon_dup.json"), key=lambda r: (r["tx_date"], r["transaction_id"])):
+        m = sum(1 for x in linked if x["tx_value"] == r["tx_value"] and dist(x["tx_date"], r["tx_date"]) <= 7)
+        dup.append({"transaction_id": r["transaction_id"], "transaction_date": r["tx_date"], "transaction_content": r["tx_content"],
+                    "amount": r["tx_value"], "side": r["tx_side"], "connected_account": subnames.get(r["connected_sub_account_id"], ""),
+                    "amazon_linked_same_amount_within_7d": m})
+    write_csv(review / "review_amazon_dup.csv", dup, close.REVIEW_AMAZON_COLUMNS)
+
+    son = [r for r in rows if r["inference_source"] == "sonnet"]
+    usage = [r["usage"] for r in results.values()]
+    summary = {
+        "ai_targets": len(rows), "routing": dict(Counter(r["routing"] for r in rows)),
+        "rule_candidates": sum(1 for r in rows if r["routing"] == close.RULE_CANDIDATE),
+        "sonnet_processed": len(son),
+        "sonnet_conf_bands": dict(Counter(close.conf_band(r["confidence"] if r["confidence"] != "" else None) for r in son)),
+        "sonnet_auto_candidates": sum(1 for r in rows if r["routing"] == close.SONNET_AUTO),
+        "sonnet_to_human": sum(1 for r in son if r["routing"] == close.HUMAN),
+        "auto_candidates": sum(1 for r in rows if r["routing"] in (close.RULE_CANDIDATE, close.SONNET_AUTO)),
+        "human_review": sum(1 for r in rows if r["routing"] == close.HUMAN),
+        "review_groups": len({r["review_group"] for r in rows}),
+        "review_groups_by_routing": dict(Counter(r["routing"] for r in {r["review_group"]: r for r in rows}.values())),
+        "amazon_dup_candidates": len(dup),
+        "usage": {k: sum(u[k] for u in usage) for k in ("input", "cache_write", "cache_read", "output")} if usage else None,
+        "estimated_cost_usd": round(sum(phase4.usage_cost("claude-sonnet-5", r["usage"]) for r in results.values()), 2),
+    }
+    save_json(review / "summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=1))
+    print(f"保存先: {review}")
+
+
 def cmd_llm_run(settings: Settings, args) -> None:
     rows, accounts, out = _phase4_context(settings)
     dry = out / args.name
@@ -1279,6 +1422,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("llm-eval", help="Phase 4: LLM 結果の評価（正解と照合, 値は表示しない）")
     sp.add_argument("--results", required=True, help="dry_run 内の results_*.jsonl")
     sp.set_defaults(func=cmd_llm_eval)
+
+    sp = sub.add_parser("close-prepare", help="決算処理: 対象抽出・口座系統統合・Amazon除外・層分け・Sonnet payload 作成（APIは呼ばない）")
+    sp.add_argument("--fy", type=int, default=2025)
+    sp.set_defaults(func=cmd_close_prepare)
+
+    sp = sub.add_parser("close-review", help="決算処理: Sonnet 結果と合わせてレビュー用 CSV を生成（MF write なし）")
+    sp.add_argument("--fy", type=int, default=2025)
+    sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
+    sp.set_defaults(func=cmd_close_review)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")

@@ -449,3 +449,33 @@ FY2024 で得た判断基準が別年度でも再現するかを確認した。F
 ### 暫定方針
 - **Balanced を今後の実運用設計の基準候補とする**（production の確定ルールではない）
 - 次の検証候補: FY2022、および FY2026 以降の新規データ（実運用に最も近い将来データ）
+
+## FY2025 決算処理: AI 分類とレビュー CSV（2026-09-29）
+
+FY2025（2025-08-01〜2026-07-31, 免税事業者）の連携明細 1,205件を分類した。**MF への write なし**。
+`mf close-prepare --fy 2025` → `mf llm-run --name fy2025_close --model claude-sonnet-5 --effort medium --max-cost 5 --resume` → `mf close-review --fy 2025`。
+条件はすべて `src/mf_accounting/close.py` の定数で明示（楽天カード系統・Amazon 除外・routing）。
+
+### 対象抽出
+- Amazon 連携 111件: ユーザーが MF 画面で手動処理（AI 対象外）
+- Amazon 重複確認候補 59件: カード明細の摘要（NFKC・大文字）に AMAZON / アマゾン を含むもの。AWS（AMAZON WEB SERVICES）4件は含めない。Amazon 側の処理後に人間が確認
+- **AI processing targets: 1,035件**
+- 楽天カードの7口座（カード更新 4004 → 9023 → 2676、【利用不可】9023 の再登録、追加 Visa 4235）は、勘定科目推定上1つの口座系統として扱う（`ACCOUNT_LINEAGES`）。統合後、「口座が過去履歴にない」明細は 0件
+- 履歴は FY2018〜FY2024 のみ。FY2025 の仕訳・正解・未来情報は使っていない
+
+### 結果
+| 項目 | 件数 |
+|---|---:|
+| Balanced rule candidates（高confidence かつ 口座系統が過去履歴にある） | 261 |
+| Sonnet processed（A 378 / B 88 / C 199 / C+D 22 / D 63） | 750 |
+| Sonnet auto candidates | 177 |
+| **total auto candidates** | **438 / 42.3%** |
+| human review（Sonnet 573 + E層 24） | 597 |
+| review groups（review_ai.csv） | 468 |
+| Amazon duplicate candidates | 59 |
+
+- Sonnet の confidence 条件は **confidence ≥0.90 かつ needs_review=false・insufficient=false**。FY2023 で事前登録した Balanced と同じ固定条件で、FY2025 の結果を見て変更していない
+- prompt / schema / account catalog は FY2023/FY2024 とハッシュが一致
+- **Sonnet estimated cost: $3.60**（usage から計算、count_tokens 見積もり $4.45、上限 $5）。APITimeoutError で2回停止（生成中に1回、再開時の count_tokens で1回）し、`--resume` で完走。エラー 0、stop_reason はすべて end_turn
+- **FY2025 には正解ラベルがないため、auto candidate の実精度は未検証**（参考: 同条件の Sonnet conf≥0.90 は FY2023 98.2% / FY2024 97.8%）
+- 実データ・LLM response・review CSV（`data/fy2025_close/`, `data/processed/.../phase4/fy2025_close/`）は Git 管理外
