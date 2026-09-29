@@ -369,13 +369,14 @@ def _line(acct: tuple, value: int) -> dict:
     return {"account_id": acct[0], "sub_account_id": acct[1], "value": value}
 
 
-def journal_branches(side: str, value: int, primary: str, source_acct: tuple, funding: str, loan_account: str) -> list[dict]:
+def journal_branches(side: str, value: int, primary: str, source_acct: tuple, funding: str, loan_account: str,
+                     primary_sub: str | None = None) -> list[dict]:
     """1明細の仕訳（branches: debitor / creditor）。source_acct = 連携口座の (account_id, sub_account_id)。
 
     個人カード: 費用/未払金(カード) + 未払金(カード)/長期借入金 → 未払金は同じサブ口座で相殺され、実質 費用/長期借入金。
     入金（返金等）は同じ構造の貸借逆。法人カード・銀行は振替なし。
     """
-    p = (primary, None)
+    p = (primary, primary_sub)
     first = {"debitor": _line(p, value), "creditor": _line(source_acct, value)}
     if side == "INCOME":
         first = {"debitor": _line(source_acct, value), "creditor": _line(p, value)}
@@ -410,4 +411,113 @@ def reconcile(journals: list[dict], liability_account: str, loan_account: str) -
                       "payable_net_zero_every_transaction": per_tx_ap_zero,
                       "loan_net_equals_usage_minus_refund": (ln_cr - ln_dr) == r["usage_total"] - r["refund_total"] if src == FOUNDER_PERSONAL_CARD else None})
         out[src] = r
+    return out
+
+
+# ---- 最終レビュー結果（assistant_* 列）の反映と仕訳検証 --------------------------------------
+EXCLUDED = "excluded"
+AUTO_ROUTINGS = (RULE_CANDIDATE, SONNET_AUTO)
+
+
+def final_decision(group: dict, account_ids: dict[str, str]) -> tuple[str, str, str]:
+    """assistant_recommendation → (status, account_id, problem)。human_decision 列は使わない（上書きもしない）。
+
+    approve → 推定科目 / correct → assistant_correction_account / exclude → 仕訳対象外
+    existing_auto_candidate → rule_candidate・sonnet_auto_candidate の既存自動判定（推定科目）
+    """
+    rec = (group.get("assistant_recommendation") or "").strip()
+    proposed = group.get("proposed_primary_account_id") or ""
+    if rec == "exclude":
+        return EXCLUDED, "", ""
+    if rec == "approve" or (rec == "existing_auto_candidate" and group.get("routing") in AUTO_ROUTINGS):
+        return (CONFIRMED, proposed, "") if proposed else (INVALID, "", f"{rec} だが推定科目がない")
+    if rec == "correct":
+        name = (group.get("assistant_correction_account") or "").strip()
+        return (CONFIRMED, account_ids[name], "") if name in account_ids else (INVALID, "", f"修正科目を解決できない: {name!r}")
+    if rec == "existing_auto_candidate":
+        return INVALID, "", f"existing_auto_candidate だが routing が {group.get('routing')}"
+    return (UNDECIDED if rec == "ask_hiro" else INVALID), "", f"assistant_recommendation={rec!r}"
+
+
+def validate_final(transactions: list[dict], journals: list[dict], fy_start: str, fy_end: str, payable: str) -> list[dict]:
+    """transactions: 明細ごとの最終状態（status, journal_status, funding_source 等）。journals: {transaction_id, date, funding, branches}。"""
+    checks = []
+    def add(check, level, bad, detail=""):
+        checks.append({"check": check, "level": level, "result": "fail" if bad else "pass", "count": len(bad),
+                       "detail": detail, "transaction_ids": " ".join(sorted(bad))[:2000]})
+    lines = [(j, b, s) for j in journals for b in j["branches"] for s in ("debitor", "creditor")]
+    dr = sum(b["debitor"]["value"] for j in journals for b in j["branches"])
+    cr = sum(b["creditor"]["value"] for j in journals for b in j["branches"])
+    add("借方合計 = 貸方合計（全体・仕訳ごと）", "error",
+        {j["transaction_id"] for j in journals if sum(b["debitor"]["value"] for b in j["branches"]) != sum(b["creditor"]["value"] for b in j["branches"])}
+        | ({"TOTAL"} if dr != cr else set()), f"借方 {dr:,} / 貸方 {cr:,}")
+    add("金額0の仕訳行がない", "error", {j["transaction_id"] for j, b, s in lines if not b[s]["value"] or b[s]["value"] <= 0})
+    excluded = {t["transaction_id"] for t in transactions if t["status"] in (EXCLUDED, MERGED)}
+    add("exclude・統合済み明細が仕訳に含まれていない", "error", {j["transaction_id"] for j in journals} & excluded)
+    pending = [t for t in transactions if t["status"] not in (EXCLUDED, MERGED) and t["journal_status"] != "generated"]
+    add("未確定科目がない（仕訳対象はすべて仕訳化）", "error", {t["transaction_id"] for t in pending},
+        "; ".join(sorted({f"{t['journal_status']}: {t['problem']}" if t["problem"] else t["journal_status"] for t in pending})))
+    jids = {j["transaction_id"] for j in journals}
+    add("統合済み明細の統合先に仕訳がある", "error",
+        {t["transaction_id"] for t in transactions if t["status"] == MERGED and t.get("merged_into") not in jids})
+    add("ask_hiro が0件", "error", {t["transaction_id"] for t in transactions if t["recommendation"] == "ask_hiro"})
+    bad_ap = set()
+    for j in journals:
+        if j["funding"] != FOUNDER_PERSONAL_CARD:
+            continue
+        net = Counter()
+        for b in j["branches"]:
+            if b["debitor"]["account_id"] == payable:
+                net[b["debitor"]["sub_account_id"]] += b["debitor"]["value"]
+            if b["creditor"]["account_id"] == payable:
+                net[b["creditor"]["sub_account_id"]] -= b["creditor"]["value"]
+        if any(net.values()) or None in net or not net:
+            bad_ap.add(j["transaction_id"])
+    add("個人カードの未払金が同じカード補助科目・同額で相殺", "error", bad_ap)
+    add("FY期間外の取引がない", "error", {j["transaction_id"] for j in journals if not fy_start <= j["date"] <= fy_end}, f"{fy_start}〜{fy_end}")
+    ids = Counter(j["transaction_id"] for j in journals)
+    add("同一取引の重複仕訳がない", "error", {k for k, v in ids.items() if v > 1})
+    return checks
+
+
+# ---- 最終レビュー後の明細単位の上書き（final_overrides.csv） ----------------------------------
+# action: exclude（帳簿対象外）/ set_counter_sub_account（主科目側の補助科目, 例: 口座間振替の相手口座）/
+#         merged_into（口座間振替の片側。仕訳は target_transaction_id 側の1仕訳に統合）/
+#         confirm_refund（自動判定のカード返金を人間が確認済み。refund_review を解除し、購入時と逆の仕訳を作る）/
+#         set_account（主科目を人間の確認結果で置き換える。例: 創業者個人口座への返済 → 長期借入金）
+MERGED = "merged"
+OVERRIDE_ACTIONS = ("exclude", "set_counter_sub_account", "merged_into", "confirm_refund", "set_account")
+
+
+def load_overrides(rows: list[dict], sub_ids: dict[str, str], known_tx: set[str], account_ids: dict[str, str] | None = None) -> dict[str, dict]:
+    """final_overrides.csv の行 → transaction_id ごとの上書き。補助科目は名前で指定し ID に解決する。不正な行は ValueError。"""
+    out = {}
+    for r in rows:
+        tid, action = r["transaction_id"].strip(), r["action"].strip()
+        if tid not in known_tx:
+            raise ValueError(f"overrides: 未知の transaction_id {tid}")
+        if action not in OVERRIDE_ACTIONS:
+            raise ValueError(f"overrides: 不明な action {action!r}")
+        if tid in out:
+            raise ValueError(f"overrides: transaction_id が重複 {tid}")
+        o = {"action": action, "reason": r.get("reason", "")}
+        if action == "set_counter_sub_account":
+            name = r.get("counter_sub_account", "").strip()
+            if name not in sub_ids:
+                raise ValueError(f"overrides: 補助科目を解決できない {name!r}")
+            o["sub_account_id"] = sub_ids[name]
+        if action == "set_account":
+            name = r.get("account", "").strip()
+            if name not in (account_ids or {}):
+                raise ValueError(f"overrides: 科目を解決できない {name!r}")
+            o["account_id"] = account_ids[name]
+        if action == "merged_into":
+            target = r.get("target_transaction_id", "").strip()
+            if target not in known_tx or target == tid:
+                raise ValueError(f"overrides: merged_into の統合先が不正 {target!r}")
+            o["target"] = target
+        out[tid] = o
+    for tid, o in out.items():
+        if o["action"] == "merged_into" and (out.get(o["target"]) or {}).get("action") == "exclude":
+            raise ValueError(f"overrides: 統合先 {o['target']} が exclude")
     return out

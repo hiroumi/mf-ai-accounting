@@ -479,3 +479,43 @@ FY2025（2025-08-01〜2026-07-31, 免税事業者）の連携明細 1,205件を�
 - **Sonnet estimated cost: $3.60**（usage から計算、count_tokens 見積もり $4.45、上限 $5）。APITimeoutError で2回停止（生成中に1回、再開時の count_tokens で1回）し、`--resume` で完走。エラー 0、stop_reason はすべて end_turn
 - **FY2025 には正解ラベルがないため、auto candidate の実精度は未検証**（参考: 同条件の Sonnet conf≥0.90 は FY2023 98.2% / FY2024 97.8%）
 - 実データ・LLM response・review CSV（`data/fy2025_close/`, `data/processed/.../phase4/fy2025_close/`）は Git 管理外
+
+## FY2025 決算処理: 連携明細の final close と検証（2026-09-29〜30）
+
+FY2025 の連携明細（AI 対象 1,035件）について、最終レビュー結果から最終仕訳を生成し検証した。**MF Cloud への書き込み・import はまだ実行していない**。
+
+### 実装
+- `mf close-groups`: レビューをグループ単位化（review_groups.csv / review_group_members.csv）
+- `mf close-finalize --preview`: group 判断の明細展開、資金源別の仕訳構造、検算
+- `mf close-final --assisted <最終レビューCSV> --overrides data/fy2025_close/review/final_overrides.csv --suffix _v4`:
+  最終レビュー（assistant_recommendation: approve / correct / exclude / existing_auto_candidate）を反映し、
+  `fy2025_final_transactions / final_journals / validation_report / bankbook_review` を出力
+- `final_overrides.csv`（Git 管理外）で明細単位の手動確定: `exclude` / `merged_into` / `set_account` / `set_counter_sub_account` / `confirm_refund`。
+  科目・補助科目は名前で指定し MF マスターの ID に解決（解決できなければ停止）
+- 資金源（`FUNDING_SOURCES`）: 連携口座単位で明示。楽天 Mastercard 系列・楽天 Visa 4235・Amex Delta = 創業者個人カード、銀行3口座。一致しない口座は unconfirmed（カード種別から推測しない）
+- 個人カード: `費用 / 未払金[カード]` + `未払金[同カード] / 長期借入金`。返金は逆仕訳。法人カード・銀行は振替なし。FY2025 は免税のため税区分は対象外・税額0
+
+### 手動確定の内容（final_overrides.csv 16件）
+- FY2024 購入分の返金（Apple Store 293,600 / えきねっと 11,290）は FY2025 で処理しない（exclude）
+- FY2025 内で完結した楽天トラベル返金 2件は confirm_refund（旅費交通費・長期借入金を購入時と逆に計上）
+- 口座間振替: 2025-08-25 三井住友→ゆうちょ 100,000 は出金・入金の2明細を1仕訳に統合（merged_into）。みずほ→三井住友 2件、三井住友→城南信用金庫 2件は相手口座の補助科目を指定
+- 三井住友からの出金 5件（520,000）は創業者への長期借入金返済（set_account 長期借入金）
+- Deloitte Tohmatsu Risk Advisory 4,999,671 は売上高（FY2024 の同一支払元・FY2023 以降の補助金処理との継続性。補助金収入科目は MF マスターに存在しない）
+
+### v4 検証結果
+| 項目 | 結果 |
+|---|---:|
+| 仕訳対象 / 生成仕訳 | 1,019 / 1,019（1,951行） |
+| exclude / 統合 | 15 / 1 |
+| **借方合計 = 貸方合計** | **24,154,590 = 24,154,590** |
+| validation errors / warnings | **0 / 0** |
+| ask_hiro / needs_bankbook_review | **0 / 0** |
+| 個人カード: 未払金 借方 = 貸方 | 3,380,958 = 3,380,958（全932仕訳で同一補助科目・同額相殺） |
+| 個人カード: 長期借入金 純増 | 3,316,932 = 利用 3,348,945 − 返金 32,013 |
+
+- 検証項目: 借方=貸方（全体・仕訳ごと）、金額0なし、exclude・統合済み明細の混入なし、未確定科目なし、ask_hiro 0、未払金相殺、FY 期間外なし、同一取引の重複仕訳なし、口座間振替の二重計上なし、前年度購入の返金の扱い
+
+### 次の作業（AI 会計エージェント側）
+- MF Cloud への反映方法（API write / import CSV）の確定と実行
+- Amazon 連携 111件・Amazon 重複確認候補 59件はユーザーが MF 画面で処理
+- みずほ銀行・給与・出張手当・現金取引は別途手作業で処理するため、開発タスクには含めない

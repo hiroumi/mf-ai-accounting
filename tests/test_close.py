@@ -144,3 +144,66 @@ def test_personal_card_journal_nets_payable_and_books_loan():
     assert (p["loan_increase"], p["loan_decrease"], p["loan_net"]) == (10000, 3000, 7000)
     assert p["payable_net"] == 0 and p["payable_net_zero_every_transaction"] and p["loan_net_equals_usage_minus_refund"]
     assert r[close.CORPORATE_CARD]["usage_total"] == 5000 and r[close.CORPORATE_CARD]["loan_increase"] == 0
+
+
+def test_final_decision_uses_assistant_columns_only():
+    ids = {"会議費": "MTG"}
+    g = lambda rec, routing=close.HUMAN, corr="", proposed="EXP": {"assistant_recommendation": rec, "assistant_correction_account": corr,
+                                                                  "routing": routing, "proposed_primary_account_id": proposed,
+                                                                  "human_decision": "exclude"}  # human_decision は無視
+    assert close.final_decision(g("approve"), ids) == (close.CONFIRMED, "EXP", "")
+    assert close.final_decision(g("correct", corr="会議費"), ids) == (close.CONFIRMED, "MTG", "")
+    assert close.final_decision(g("correct", corr="補助金収入"), ids)[0] == close.INVALID  # マスターにない科目
+    assert close.final_decision(g("exclude"), ids)[0] == close.EXCLUDED
+    assert close.final_decision(g("existing_auto_candidate", routing=close.RULE_CANDIDATE), ids) == (close.CONFIRMED, "EXP", "")
+    assert close.final_decision(g("existing_auto_candidate"), ids)[0] == close.INVALID  # human_review には使えない
+    assert close.final_decision(g("ask_hiro"), ids)[0] == close.UNDECIDED
+    assert close.final_decision(g("approve", proposed=""), ids)[0] == close.INVALID
+
+
+def test_validate_final_checks():
+    card = ("AP", "C1")
+    ok = {"transaction_id": "t1", "date": "2025-09-01", "funding": close.FOUNDER_PERSONAL_CARD,
+          "branches": close.journal_branches("EXPENSE", 1000, "EXP", card, close.FOUNDER_PERSONAL_CARD, "LOAN")}
+    out_of_fy = {**ok, "transaction_id": "t2", "date": "2026-08-01"}
+    dup = {**ok}
+    txs = [{"transaction_id": "t1", "status": close.CONFIRMED, "journal_status": "generated", "recommendation": "approve", "problem": ""},
+           {"transaction_id": "t2", "status": close.CONFIRMED, "journal_status": "generated", "recommendation": "approve", "problem": ""},
+           {"transaction_id": "t3", "status": close.EXCLUDED, "journal_status": "excluded", "recommendation": "exclude", "problem": ""},
+           {"transaction_id": "t4", "status": close.UNDECIDED, "journal_status": "undecided", "recommendation": "ask_hiro", "problem": ""}]
+    res = {c["check"]: c for c in close.validate_final(txs, [ok, out_of_fy, dup], "2025-08-01", "2026-07-31", "AP")}
+    failed = {k for k, c in res.items() if c["result"] == "fail"}
+    assert failed == {"未確定科目がない（仕訳対象はすべて仕訳化）", "ask_hiro が0件", "FY期間外の取引がない", "同一取引の重複仕訳がない"}
+    excl = {**ok, "transaction_id": "t3"}
+    res = {c["check"]: c for c in close.validate_final(txs[:1] + txs[2:3], [ok, excl], "2025-08-01", "2026-07-31", "AP")}
+    assert res["exclude・統合済み明細が仕訳に含まれていない"]["result"] == "fail"
+
+
+def test_load_overrides_validates_and_resolves_sub_accounts():
+    subs = {"みずほ銀行": "S_MIZUHO"}
+    rows = [{"transaction_id": "a", "action": "exclude", "reason": "r"},
+            {"transaction_id": "b", "action": "set_counter_sub_account", "counter_sub_account": "みずほ銀行"},
+            {"transaction_id": "c", "action": "merged_into", "target_transaction_id": "b"}]
+    o = close.load_overrides(rows + [{"transaction_id": "d", "action": "confirm_refund", "reason": "r"}], subs, {"a", "b", "c", "d"})
+    assert o["b"]["sub_account_id"] == "S_MIZUHO" and o["c"]["target"] == "b" and o["d"]["action"] == "confirm_refund"
+    import pytest
+    for bad in ([{"transaction_id": "x", "action": "exclude"}],
+                [{"transaction_id": "a", "action": "guess"}],
+                [{"transaction_id": "b", "action": "set_counter_sub_account", "counter_sub_account": "城南信用金庫"}],
+                [{"transaction_id": "c", "action": "merged_into", "target_transaction_id": "a"}, {"transaction_id": "a", "action": "exclude"}]):
+        with pytest.raises(ValueError):
+            close.load_overrides(bad, subs, {"a", "b", "c"})
+
+
+def test_bank_transfer_journal_uses_counter_sub_account():
+    b = close.journal_branches("EXPENSE", 100000, "DEP", ("DEP", "SMBC"), close.BANK, "LOAN", primary_sub="YUCHO")
+    assert b == [{"debitor": {"account_id": "DEP", "sub_account_id": "YUCHO", "value": 100000},
+                  "creditor": {"account_id": "DEP", "sub_account_id": "SMBC", "value": 100000}}]
+
+
+def test_load_overrides_set_account():
+    o = close.load_overrides([{"transaction_id": "a", "action": "set_account", "account": "長期借入金"}], {}, {"a"}, {"長期借入金": "LOAN"})
+    assert o["a"]["account_id"] == "LOAN"
+    import pytest
+    with pytest.raises(ValueError):
+        close.load_overrides([{"transaction_id": "a", "action": "set_account", "account": "補助金収入"}], {}, {"a"}, {"長期借入金": "LOAN"})

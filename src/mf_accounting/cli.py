@@ -1127,6 +1127,167 @@ def cmd_close_finalize(settings: Settings, args) -> None:
     print(f"保存先: {final}")
 
 
+def cmd_close_final(settings: Settings, args) -> None:
+    """決算処理: 最終レビュー結果（assistant_* 列）を反映し、最終明細・仕訳・検証レポートを CSV で出力する（MF write・import CSV なし）。"""
+    import csv as _csv
+    from . import close
+    fy = args.fy
+    history, accounts, connected, _, dry, close_dir, _ = _close_context(settings, fy)
+    office_code = settings.require_office_code()
+    masters = latest_run_dir(close_dir, office_code, "masters")
+    sub_names = {s["id"]: s.get("name") for s in load_json(masters / "sub_accounts.json").get("sub_accounts") or []}
+    taxes = load_json(masters / "taxes.json").get("taxes") or []
+    tax_free = next(t for t in taxes if t.get("name") == "対象外" and t.get("available"))
+    term = next(t for t in load_json(masters / "term_settings.json")["term_settings"] if t.get("fiscal_year") == fy)
+    fy_start, fy_end = term["start_date"], term["end_date"]
+    subs = {s["id"]: (a["name"], s) for a in connected for s in a.get("connected_sub_accounts") or []}
+    names = {a["id"]: a.get("name") for a in accounts}
+    by_name = {a["name"]: a["id"] for a in accounts if a.get("available")}
+    payable, loan, deposit = by_name["未払金"], by_name[close.FOUNDER_LOAN_ACCOUNT], by_name["普通預金"]
+    read = lambda p: list(_csv.DictReader(Path(p).open(encoding="utf-8-sig")))
+    groups = {g["review_group"]: g for g in read(args.assisted)}
+    base = {g["review_group"]: g for g in read(close_dir / "review" / "review_groups.csv")}
+    keycols = ("group_size", "routing", "proposed_primary_account_id", "representative_description", "amount_total")
+    if set(groups) != set(base) or any(groups[k][c] != base[k][c] for k in base for c in keycols):
+        raise ConfigError("最終レビュー CSV のグループが review_groups.csv と一致しません。")
+    members = read(close_dir / "review" / "review_group_members.csv")
+    items = {i["transaction_id"]: i for i in load_json(dry / "items.json")}
+    if {m["transaction_id"] for m in members} != set(items) or len(members) != len(items):
+        raise ConfigError("review_group_members.csv の明細が AI 対象と一致しません。")
+    sub_ids = {v: k for k, v in sub_names.items()}
+    overrides = close.load_overrides(read(args.overrides), sub_ids, set(items), by_name) if args.overrides else {}
+    # 口座間振替の相手口座の参考: 過去に同じ口座・同じ加盟店キーの明細が 普通預金 のどの補助科目で記帳されたか（自動設定はしない）
+    past_counter: dict = {}
+    for h in history:
+        if h.get("primary_account_id") == deposit and h.get("primary_sub_account_name"):
+            k = (h["connected_sub_account_id"], close.merchant_key(h["tx_content"]))
+            past_counter.setdefault(k, Counter())[h["primary_sub_account_name"]] += 1
+            past_counter.setdefault(("last",) + k, {})[h["primary_sub_account_name"]] = h["tx_date"]
+
+    txs, journals = [], []
+    for m in sorted(members, key=lambda m: (items[m["transaction_id"]]["tx_date"], m["transaction_id"])):
+        it, g = items[m["transaction_id"]], groups[m["review_group"]]
+        cname, s = subs[it["connected_sub_account_id"]]
+        funding = close.funding_source(cname, s.get("name"))
+        status, acct, problem = close.final_decision(g, by_name)
+        rec = g.get("assistant_recommendation", "")
+        card = funding != close.BANK
+        ov = overrides.get(it["transaction_id"]) or {}
+        if ov.get("action") == "exclude":
+            status, acct, problem = close.EXCLUDED, "", f"override: {ov['reason']}"
+        elif ov.get("action") == "merged_into":
+            status, problem = close.MERGED, f"override: {ov['reason']}"
+        elif ov.get("action") == "set_account":
+            status, acct, problem = close.CONFIRMED, ov["account_id"], ""
+        primary_sub = ov.get("sub_account_id")
+        if status == close.EXCLUDED:
+            jstatus = "excluded"
+        elif status == close.MERGED:
+            jstatus = "merged_transfer"
+        elif status != close.CONFIRMED:
+            jstatus = "undecided"
+        elif funding in (close.UNCONFIRMED, close.OTHER):
+            jstatus = "funding_unconfirmed"
+        elif card and it["tx_side"] == "INCOME" and rec == "existing_auto_candidate" and ov.get("action") != "confirm_refund":
+            jstatus, problem = "refund_review", "自動判定の返金（人間レビュー未実施）"  # 既存の安全ルール
+        elif card and acct in (payable, loan):
+            jstatus, problem = "structure_review", "カード明細の主科目が未払金・長期借入金"
+        else:
+            jstatus = "generated"
+        t = {"transaction_id": it["transaction_id"], "transaction_date": it["tx_date"], "transaction_content": it["tx_content"],
+             "amount": it["tx_value"], "side": it["tx_side"], "connected_service": cname, "connected_account": s.get("name"),
+             "funding_source": funding, "review_group": m["review_group"], "routing": g["routing"], "recommendation": rec,
+             "proposed_account": g["proposed_account"], "final_account": names.get(acct, ""), "final_account_id": acct,
+             "final_sub_account": sub_names.get(primary_sub, "") if primary_sub else "",
+             "status": status, "journal_status": jstatus, "problem": problem, "merged_into": ov.get("target", ""),
+             "override": ov.get("action", ""), "assistant_reason": g.get("assistant_reason", "")}
+        bankbook = jstatus == "generated" and funding == close.BANK and acct == deposit and not primary_sub
+        est = past_counter.get((it["connected_sub_account_id"], close.merchant_key(it["tx_content"])))
+        last = past_counter.get(("last", it["connected_sub_account_id"], close.merchant_key(it["tx_content"]))) or {}
+        t.update({"needs_bankbook_review": bankbook,
+                  "estimated_counter_account": "; ".join(f"過去仕訳: {k}（{v}件, 最終 {last.get(k)}）" for k, v in est.most_common()) if bankbook and est else ""})
+        txs.append(t)
+        if jstatus == "generated":
+            journals.append({"transaction_id": t["transaction_id"], "date": it["tx_date"], "funding": funding, "side": it["tx_side"],
+                             "value": it["tx_value"], "remark": it["tx_content"],
+                             "branches": close.journal_branches(it["tx_side"], it["tx_value"], acct, (s.get("account_id"), s.get("sub_account_id")),
+                                                                 funding, loan, primary_sub)})
+
+    checks = close.validate_final(txs, journals, fy_start, fy_end, payable)
+    # 警告（仕訳の形式としては成立するが、判断の確認が必要なもの）
+    def warn(check, bad, detail):
+        checks.append({"check": check, "level": "warning", "result": "fail" if bad else "pass", "count": len(bad), "detail": detail,
+                       "transaction_ids": " ".join(sorted(bad))})
+    same_account = {j["transaction_id"] for j in journals for b in j["branches"] if b["debitor"]["account_id"] == b["creditor"]["account_id"] == deposit}
+    bankbook = {t["transaction_id"] for t in txs if t["needs_bankbook_review"]}
+    checks.append({"check": "口座間振替: 相手口座を通帳で確認（needs_bankbook_review, 相手側の明細データなし）", "level": "info",
+                   "result": "flagged" if bankbook else "pass", "count": len(bankbook), "detail": "相手口座（みずほ銀行・城南信用金庫等）を推測で設定していない",
+                   "transaction_ids": " ".join(sorted(bankbook))})
+    tr = [t for t in txs if t["transaction_id"] in same_account]
+    pairs = {t["transaction_id"] for t in tr for u in tr if t is not u and t["amount"] == u["amount"] and t["side"] != u["side"]
+             and t["connected_account"] != u["connected_account"] and abs((date.fromisoformat(t["transaction_date"]) - date.fromisoformat(u["transaction_date"])).days) <= 3}
+    warn("口座間振替が両方の口座で仕訳化（二重計上の可能性）", pairs, "出金側・入金側の両方の明細から 普通預金/普通預金 を作っている。片方のみにするか確認")
+    prior = {(h["tx_value"], h["tx_content"].strip()[:12]) for h in history}
+    prior_fy = lambda t: (t["amount"], t["transaction_content"].replace("お支払/調整分", "").strip()[:12]) in prior
+    ex_refund = {t["transaction_id"] for t in txs if t["status"] == close.EXCLUDED and t["side"] == "INCOME" and t["funding_source"] != close.BANK and prior_fy(t)}
+    acked = {i for i in ex_refund if (overrides.get(i) or {}).get("action") == "exclude"}  # overrides で明示的に exclude と確定したもの
+    warn("前年度に計上済みの購入に対する返金を exclude", ex_refund - acked, "購入側は前年度に計上済み。返金だけ除外すると長期借入金・前年度の費用が残る")
+    checks.append({"check": "前年度購入の返金を exclude（明示的に確定済み）", "level": "info", "result": "acknowledged" if acked else "pass",
+                   "count": len(acked), "detail": "; ".join(sorted((overrides[i]["reason"] for i in acked))), "transaction_ids": " ".join(sorted(acked))})
+    rf = {t["transaction_id"] for t in txs if t["journal_status"] in ("generated", "refund_review") and t["side"] == "INCOME"
+          and t["funding_source"] != close.BANK and prior_fy(t)}
+    warn("前年度購入の返金", rf, "過年度分の返金。当年度の費用の戻し（または雑収入）で良いか確認")
+
+    final = close_dir / "final"
+    sfx = args.suffix
+    write_csv(final / f"fy{fy}_final_transactions{sfx}.csv", txs, list(txs[0].keys()))
+    bb = [{"transaction_date": t["transaction_date"], "amount": t["amount"], "direction": "出金" if t["side"] == "EXPENSE" else "入金",
+           "digital_bank_account": f"{t['connected_service']} / {t['connected_account']}", "transaction_content": t["transaction_content"],
+           "estimated_counter_account": t["estimated_counter_account"], "needs_bankbook_review": "要通帳確認", "transaction_id": t["transaction_id"]}
+          for t in txs if t["needs_bankbook_review"]]
+    write_csv(final / f"fy{fy}_bankbook_review{sfx}.csv", bb,
+              ["transaction_date", "amount", "direction", "digital_bank_account", "transaction_content", "estimated_counter_account", "needs_bankbook_review", "transaction_id"])
+    jl = []
+    for n, j in enumerate(journals, start=1):
+        for bn, b in enumerate(j["branches"], start=1):
+            jl.append({"journal_no": n, "branch": bn, "transaction_id": j["transaction_id"], "transaction_date": j["date"], "funding_source": j["funding"],
+                       "debit_account": names.get(b["debitor"]["account_id"]), "debit_sub_account": sub_names.get(b["debitor"]["sub_account_id"], ""),
+                       "debit_tax": tax_free["name"], "debit_tax_value": 0, "debit_amount": b["debitor"]["value"],
+                       "credit_account": names.get(b["creditor"]["account_id"]), "credit_sub_account": sub_names.get(b["creditor"]["sub_account_id"], ""),
+                       "credit_tax": tax_free["name"], "credit_tax_value": 0, "credit_amount": b["creditor"]["value"], "remark": j["remark"],
+                       "debit_account_id": b["debitor"]["account_id"], "debit_sub_account_id": b["debitor"]["sub_account_id"] or "",
+                       "credit_account_id": b["creditor"]["account_id"], "credit_sub_account_id": b["creditor"]["sub_account_id"] or "",
+                       "tax_id": tax_free["id"]})
+    write_csv(final / f"fy{fy}_final_journals{sfx}.csv", jl, list(jl[0].keys()))
+    write_csv(final / f"fy{fy}_validation_report{sfx}.csv", checks, ["check", "level", "result", "count", "detail", "transaction_ids"])
+
+    by_acct: dict = {}
+    for l in jl:
+        for side in ("debit", "credit"):
+            a = by_acct.setdefault(l[f"{side}_account"], {"debit": 0, "credit": 0})
+            a[side] += l[f"{side}_amount"]
+    summary = {
+        "source_transactions": len(txs), "excluded": sum(1 for t in txs if t["status"] == close.EXCLUDED),
+        "merged_transfer": sum(1 for t in txs if t["status"] == close.MERGED),
+        "journal_targets": sum(1 for t in txs if t["status"] not in (close.EXCLUDED, close.MERGED)),
+        "needs_bankbook_review": len(bb), "journals": len(journals), "journal_lines": len(jl),
+        "debit_total": sum(l["debit_amount"] for l in jl), "credit_total": sum(l["credit_amount"] for l in jl),
+        "journal_status": dict(Counter(t["journal_status"] for t in txs)),
+        "recommendation": dict(Counter(t["recommendation"] for t in txs)),
+        "funding_source": {k: {"transactions": v, "journals": sum(1 for j in journals if j["funding"] == k)}
+                           for k, v in Counter(t["funding_source"] for t in txs).items()},
+        "by_account": {k: {**v, "net_debit": v["debit"] - v["credit"]} for k, v in sorted(by_acct.items(), key=lambda kv: -(kv[1]["debit"] + kv[1]["credit"]))},
+        "reconciliation": close.reconcile(journals, payable, loan),
+        "validation": {lvl: {"failed_checks": sum(1 for c in checks if c["level"] == lvl and c["result"] == "fail"),
+                             "rows": sum(c["count"] for c in checks if c["level"] == lvl and c["result"] == "fail")} for lvl in ("error", "warning")},
+    }
+    save_json(final / f"fy{fy}_final_summary{sfx}.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=1))
+    for c in checks:
+        print(f"[{c['level']}/{c['result']}] {c['check']}: {c['count']} {c['detail']}")
+    print(f"保存先: {final}")
+
+
 def cmd_llm_run(settings: Settings, args) -> None:
     rows, accounts, out = _phase4_context(settings)
     dry = out / args.name
@@ -1562,6 +1723,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fy", type=int, default=2025)
     sp.add_argument("--preview", action="store_true", help="未確定明細も推定科目で仮の仕訳を作り、構造と検算を確認する")
     sp.set_defaults(func=cmd_close_finalize)
+
+    sp = sub.add_parser("close-final", help="決算処理: 最終レビュー結果を反映し、最終明細・仕訳・検証レポートを出力（MF write なし）")
+    sp.add_argument("--fy", type=int, default=2025)
+    sp.add_argument("--assisted", required=True, help="最終レビュー結果（assistant_* 列付きの review_groups CSV）")
+    sp.add_argument("--overrides", help="明細単位の上書き（final_overrides.csv: transaction_id, action, counter_sub_account, target_transaction_id, reason）")
+    sp.add_argument("--suffix", default="", help="出力ファイル名の接尾辞（例: _v2）")
+    sp.set_defaults(func=cmd_close_final)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
