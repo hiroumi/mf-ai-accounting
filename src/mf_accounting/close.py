@@ -7,6 +7,7 @@ Phase 4.5 で検証した判定（phase3 / phase4 / routing と同じ正規化�
 再現のための条件（口座系統・Amazon 除外・routing）はすべてこのファイルの定数で明示する。
 """
 
+import re
 import unicodedata
 from collections import Counter
 
@@ -176,3 +177,122 @@ REVIEW_AI_COLUMNS = ["review_group", "group_size", "routing", "transaction_date"
                      "proposed_primary_account_id", "transaction_id"]
 REVIEW_AMAZON_COLUMNS = ["transaction_date", "transaction_content", "amount", "side", "connected_account",
                          "amazon_linked_same_amount_within_7d", "human_decision", "human_correction_account", "note", "transaction_id"]
+
+
+# ---- グループ単位レビュー（review_groups.csv） -------------------------------------------
+# カード会社が付ける表記ゆれ（返済方法変更の注記・国内利用の接頭辞・NFC）を除いた「加盟店キー」でまとめる。
+_MERCHANT_NOISE = [re.compile(p) for p in (r"^マスター国内利用\s*MZZ\s*", r"\s*\(ヘンサイヘンコウ\s*$", r"/NFC(?=\(|$)")]
+_TRUNCATED = re.compile(r"\(ヘンサイヘンコウ\s*$")  # この注記が付くと加盟店名の末尾が切れる
+DECISIONS = ("approve", "correct", "split", "hold")  # split: members の行単位で判断する
+GROUP_ORDER = (HUMAN, SONNET_AUTO, RULE_CANDIDATE)  # 人間確認を先頭に
+
+
+def merchant_key(content: str) -> str:
+    c = unicodedata.normalize("NFKC", content or "")
+    for p in _MERCHANT_NOISE:
+        c = p.sub("", c)
+    return phase3.NORMALIZERS[phase4.NORMALIZER](c)
+
+
+def merchant_keys(contents: list[str]) -> dict[str, str]:
+    """content → 加盟店キー。返済変更の注記で末尾が切れた名前は、同じ接頭辞の完全な名前に寄せる（一意に決まる場合のみ）。"""
+    base = {c: merchant_key(c) for c in contents}
+    full = {k for c, k in base.items() if not _TRUNCATED.search(unicodedata.normalize("NFKC", c))}
+    out = {}
+    for c, k in base.items():
+        if _TRUNCATED.search(unicodedata.normalize("NFKC", c)) and k not in full and len(k) >= 4:
+            longer = sorted(f for f in full if f.startswith(k))
+            k = longer[0] if len(longer) == 1 else k
+        out[c] = k
+    return out
+
+
+def past_summary(cands: list[dict]) -> tuple[int, str]:
+    """過去候補（phase4.candidates_before）→（exact の過去件数, 表示用の過去科目）。"""
+    fmt = lambda c: " / ".join(f"{a['name']}×{a['count']}" for a in c["accounts"])
+    exact = next((c for c in cands if c["similarity"] == 100), None)
+    if exact:
+        return exact["occurrences"], f"exact: {fmt(exact)}"
+    if cands:
+        c = cands[0]
+        return 0, f"類似{c['similarity']}「{c['content']}」: {fmt(c)}"
+    return 0, ""
+
+
+def _range(vals: list, fmt=str) -> str:
+    vals = [v for v in vals if v not in ("", None)]
+    if not vals:
+        return ""
+    lo, hi = min(vals), max(vals)
+    return fmt(lo) if lo == hi else f"{fmt(lo)}–{fmt(hi)}"
+
+
+def review_groups(rows: list[dict], past: dict[str, tuple[int, str]]) -> tuple[list[dict], list[dict]]:
+    """review_rows の行（1明細）→（1行=1グループ, グループ⇔明細の対応）。
+
+    グループ = routing × 加盟店キー × 推定科目。並び順: routing（人間確認が先）→ 推定科目（件数の多い科目から）
+    → グループ内 confidence 最大の降順 → 加盟店キー。
+    """
+    mk = merchant_keys([r["transaction_content"] for r in rows])
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r["routing"], mk[r["transaction_content"]], r["proposed_primary_account_id"]), []).append(r)
+    acct_size = Counter()
+    for (routing, _, acct), rs in groups.items():
+        acct_size[(routing, acct)] += len(rs)
+    conf = lambda rs: max((float(r["confidence"]) for r in rs if r["confidence"] != ""), default=-1.0)
+    keys = sorted(groups, key=lambda k: (GROUP_ORDER.index(k[0]), -acct_size[(k[0], k[2])], k[2], -conf(groups[k]), k[1]))
+    per_merchant = Counter((k[0], k[1]) for k in keys)
+    out, members = [], []
+    for n, k in enumerate(keys, start=1):
+        rs = sorted(groups[k], key=lambda r: (r["transaction_date"], r["transaction_id"]))
+        gid = f"G{n:04d}"
+        rep = max(rs, key=lambda r: (float(r["confidence"]) if r["confidence"] != "" else -1.0, r["transaction_date"]))
+        descs = Counter(r["transaction_content"] for r in rs)
+        pm = [past[r["transaction_id"]] for r in rs if r["transaction_id"] in past]
+        rep_past = past.get(rep["transaction_id"], (0, ""))
+        out.append({
+            "review_group": gid,
+            "group_size": len(rs),
+            "routing": k[0],
+            "representative_description": rep["transaction_content"],
+            "descriptions": " | ".join(f"{d}×{c}" if c > 1 else d for d, c in descs.most_common()),
+            "date_range": _range([r["transaction_date"] for r in rs]),
+            "amount_range": _range([int(r["amount"]) for r in rs], lambda v: f"{v:,}"),
+            "amount_total": sum(int(r["amount"]) for r in rs),
+            "side": "/".join(sorted({r["side"] for r in rs})),
+            "connected_account": " | ".join(sorted({r["connected_account"].split(" / ")[-1] for r in rs})),
+            "proposed_account": rep["proposed_primary_account"],
+            "inference_source": "/".join(sorted({r["inference_source"] for r in rs})),
+            "confidence_range": _range([float(r["confidence"]) for r in rs if r["confidence"] != ""], lambda v: f"{v:.2f}"),
+            "confidence_max": "" if conf(rs) < 0 else conf(rs),
+            "layer": "/".join(sorted({r["layer"] for r in rs})),
+            "past_match_count": max((p[0] for p in pm), default=0),
+            "past_accounts": rep_past[1],
+            "reason": rep["reason"],
+            "reason_category": rep["reason_category"],
+            "needs_review_count": sum(1 for r in rs if r["needs_review"] is True),
+            "same_merchant_other_groups": per_merchant[(k[0], k[1])] - 1,
+            "human_decision": "",
+            "human_correction_account": "",
+            "note": "",
+            "proposed_primary_account_id": k[2],
+            "review_ai_groups": " ".join(str(g) for g in sorted({r["review_group"] for r in rs})),
+        })
+        for r in rs:
+            members.append({"review_group": gid, "transaction_id": r["transaction_id"], "transaction_date": r["transaction_date"],
+                            "transaction_content": r["transaction_content"], "amount": r["amount"], "side": r["side"],
+                            "connected_account": r["connected_account"], "proposed_primary_account": r["proposed_primary_account"],
+                            "confidence": r["confidence"], "review_ai_group": r["review_group"],
+                            "row_decision_override": "", "row_correction_account": "", "row_note": ""})
+    return out, members
+
+
+REVIEW_GROUP_COLUMNS = ["review_group", "group_size", "routing", "representative_description", "descriptions", "date_range",
+                        "amount_range", "amount_total", "side", "connected_account", "proposed_account", "inference_source",
+                        "confidence_range", "confidence_max", "layer", "past_match_count", "past_accounts", "reason", "reason_category",
+                        "needs_review_count", "same_merchant_other_groups", "human_decision", "human_correction_account", "note",
+                        "proposed_primary_account_id", "review_ai_groups"]
+REVIEW_MEMBER_COLUMNS = ["review_group", "transaction_id", "transaction_date", "transaction_content", "amount", "side",
+                         "connected_account", "proposed_primary_account", "confidence", "review_ai_group",
+                         "row_decision_override", "row_correction_account", "row_note"]

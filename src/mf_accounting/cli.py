@@ -1006,6 +1006,36 @@ def cmd_close_review(settings: Settings, args) -> None:
     print(f"保存先: {review}")
 
 
+def cmd_close_groups(settings: Settings, args) -> None:
+    """決算処理: 1行=1レビューグループの review_groups.csv と、明細への展開用 review_group_members.csv（review_ai.csv は変更しない）。"""
+    from . import close
+    fy = args.fy
+    history, accounts, connected, _, dry, close_dir, _ = _close_context(settings, fy)
+    subnames = {s["id"]: f"{a['name']} / {s['name']}" for a in connected for s in a.get("connected_sub_accounts") or []}
+    names = {a["id"]: a.get("name") for a in accounts}
+    items = load_json(dry / "items.json")
+    path = dry / args.results
+    results = {r["transaction_id"]: r for r in (json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip())}
+    if any(i["routing"] == "sonnet" and i["transaction_id"] not in results for i in items):
+        raise ConfigError("Sonnet 結果が不足しています。")
+    rows = close.review_rows(items, results, names, subnames)
+    catalog = phase4.Catalog.from_accounts(accounts, available_only=True)
+    ordered = phase4.build_candidate_index(history)
+    past = {i["transaction_id"]: close.past_summary(phase4.candidates_before(ordered, i["tx_date"], i["tx_content"], catalog.id_to_code, names))
+            for i in items}
+    groups, members = close.review_groups(rows, past)
+    review = close_dir / "review"
+    write_csv(review / "review_groups.csv", groups, close.REVIEW_GROUP_COLUMNS)
+    write_csv(review / "review_group_members.csv", members, close.REVIEW_MEMBER_COLUMNS)
+    by = lambda rt: [g for g in groups if g["routing"] == rt]
+    summary = {rt: {"groups": len(by(rt)), "rows": sum(g["group_size"] for g in by(rt)),
+                    "single_row_groups": sum(1 for g in by(rt) if g["group_size"] == 1)} for rt in close.GROUP_ORDER}
+    summary["total"] = {"groups": len(groups), "rows": len(members)}
+    save_json(review / "review_groups_summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=1))
+    print(f"保存先: {review}")
+
+
 def cmd_llm_run(settings: Settings, args) -> None:
     rows, accounts, out = _phase4_context(settings)
     dry = out / args.name
@@ -1431,6 +1461,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fy", type=int, default=2025)
     sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
     sp.set_defaults(func=cmd_close_review)
+
+    sp = sub.add_parser("close-groups", help="決算処理: グループ単位レビュー用 review_groups.csv と展開用 members を生成")
+    sp.add_argument("--fy", type=int, default=2025)
+    sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
+    sp.set_defaults(func=cmd_close_groups)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
