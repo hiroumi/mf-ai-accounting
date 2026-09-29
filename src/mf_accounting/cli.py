@@ -1036,6 +1036,97 @@ def cmd_close_groups(settings: Settings, args) -> None:
     print(f"保存先: {review}")
 
 
+def cmd_close_finalize(settings: Settings, args) -> None:
+    """決算処理: レビュー判断を明細へ展開し、資金源別の仕訳構造と検算を出力する（MF write・CSV import なし）。
+
+    --preview: 未確定の明細も推定科目で仮の仕訳を作る（構造と検算の確認用。確定データとは別ファイル）。
+    """
+    import csv as _csv
+    from . import close
+    fy = args.fy
+    office_code = settings.require_office_code()
+    _, accounts, out = _phase4_context(settings)
+    dry = out / f"fy{fy}_close"
+    close_dir = settings.data_dir / f"fy{fy}_close"
+    masters = latest_run_dir(close_dir, office_code, "masters")
+    connected = load_json(masters / "connected_accounts.json").get("connected_accounts") or []
+    sub_names = {s["id"]: s.get("name") for s in load_json(masters / "sub_accounts.json").get("sub_accounts") or []}
+    subs = {s["id"]: (a["name"], s) for a in connected for s in a.get("connected_sub_accounts") or []}
+    names = {a["id"]: a.get("name") for a in accounts}
+    by_name = {a["name"]: a["id"] for a in accounts if a.get("available")}
+    payable, loan = by_name["未払金"], by_name[close.FOUNDER_LOAN_ACCOUNT]
+    read = lambda p: list(_csv.DictReader(p.open(encoding="utf-8-sig")))
+    review = close_dir / "review"
+    groups, members = read(review / "review_groups.csv"), read(review / "review_group_members.csv")
+    items = {i["transaction_id"]: i for i in load_json(dry / "items.json")}
+    if {m["transaction_id"] for m in members} != set(items):
+        raise ConfigError("review_group_members.csv の明細が AI 対象と一致しません。")
+    rows = close.expand_decisions(groups, members, by_name)
+    proposed = {g["review_group"]: g.get("proposed_primary_account_id") or "" for g in groups}
+
+    confirmed_j, preview_j, lines, preview_lines = [], [], [], []
+    for r in rows:
+        it = items[r["transaction_id"]]
+        cname, s = subs[it["connected_sub_account_id"]]
+        funding = close.funding_source(cname, s.get("name"))
+        is_card_refund = it["tx_side"] == "INCOME" and funding != close.BANK
+        if funding in (close.UNCONFIRMED, close.OTHER):
+            jstatus = "funding_unconfirmed" if funding == close.UNCONFIRMED else "not_applicable"
+        elif is_card_refund:
+            jstatus = "refund_review"
+        elif funding != close.BANK and (r["final_account_id"] or proposed.get(r["review_group"], "")) in (payable, loan):
+            jstatus = "structure_review"  # 主科目が未払金・長期借入金だと振替が崩れる
+        elif not (r["final_account_id"] or proposed.get(r["review_group"], "")):
+            jstatus = "no_proposed_account"
+        elif r["final_status"] != close.CONFIRMED:
+            jstatus = "awaiting_decision"
+        else:
+            jstatus = "ready"
+        r.update({"funding_source": funding, "journal_status": jstatus, "final_account": names.get(r["final_account_id"], ""),
+                  "connected_service": cname, "side": it["tx_side"]})
+        acct = r["final_account_id"] or proposed.get(r["review_group"], "")
+        if funding in (close.UNCONFIRMED, close.OTHER) or not acct:
+            continue
+        j = {"transaction_id": r["transaction_id"], "funding": funding, "side": it["tx_side"], "value": it["tx_value"], "status": jstatus,
+             "branches": close.journal_branches(it["tx_side"], it["tx_value"], acct, (s.get("account_id"), s.get("sub_account_id")), funding, loan)}
+        for target, jl, ll in ((jstatus == "ready", confirmed_j, lines), (True, preview_j, preview_lines)):
+            if not target:
+                continue
+            jl.append(j)
+            for n, b in enumerate(j["branches"], start=1):
+                ll.append({"transaction_id": j["transaction_id"], "transaction_date": it["tx_date"], "journal_status": jstatus,
+                           "account_basis": "final" if r["final_account_id"] else "proposed", "funding_source": funding, "branch": n,
+                           "debit_account": names.get(b["debitor"]["account_id"]), "debit_sub_account": sub_names.get(b["debitor"]["sub_account_id"], ""),
+                           "debit_amount": b["debitor"]["value"], "credit_account": names.get(b["creditor"]["account_id"]),
+                           "credit_sub_account": sub_names.get(b["creditor"]["sub_account_id"], ""), "credit_amount": b["creditor"]["value"],
+                           "tax": "対象外（FY2025 免税, 未確定）", "remark": it["tx_content"]})
+
+    final = close_dir / "final"
+    cols = ["transaction_id", "transaction_date", "transaction_content", "amount", "side", "connected_service", "connected_account",
+            "funding_source", "review_group", "group_decision", "applied_decision", "decision_source", "final_status", "final_account",
+            "final_account_id", "journal_status", "problem", "proposed_primary_account", "confidence", "row_note"]
+    write_csv(final / "reviewed_transactions.csv", rows, cols)
+    lcols = ["transaction_id", "transaction_date", "journal_status", "account_basis", "funding_source", "branch", "debit_account",
+             "debit_sub_account", "debit_amount", "credit_account", "credit_sub_account", "credit_amount", "tax", "remark"]
+    write_csv(final / "journal_lines.csv", lines, lcols)
+    summary = {
+        "transactions": len(rows), "final_status": dict(Counter(r["final_status"] for r in rows)),
+        "journal_status": dict(Counter(r["journal_status"] for r in rows)),
+        "funding_source": {k: {"count": v, "amount": sum(int(r["amount"]) for r in rows if r["funding_source"] == k)}
+                           for k, v in Counter(r["funding_source"] for r in rows).items()},
+        "funding_by_account": dict(Counter(f"{r['funding_source']} | {r['connected_account']}" for r in rows)),
+        "problems": [f"{r['transaction_id']}: {r['problem']}" for r in rows if r["final_status"] == close.INVALID],
+        "reconciliation_confirmed": close.reconcile(confirmed_j, payable, loan),
+    }
+    if args.preview:
+        write_csv(final / "journal_lines_preview.csv", preview_lines, lcols)
+        summary["reconciliation_preview_all_proposed"] = close.reconcile(preview_j, payable, loan)
+        summary["reconciliation_preview_excluding_reviews"] = close.reconcile([j for j in preview_j if j["status"] not in ("refund_review", "structure_review")], payable, loan)
+    save_json(final / "summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=1))
+    print(f"保存先: {final}")
+
+
 def cmd_llm_run(settings: Settings, args) -> None:
     rows, accounts, out = _phase4_context(settings)
     dry = out / args.name
@@ -1466,6 +1557,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fy", type=int, default=2025)
     sp.add_argument("--results", default="results_claude-sonnet-5_medium.jsonl")
     sp.set_defaults(func=cmd_close_groups)
+
+    sp = sub.add_parser("close-finalize", help="決算処理: レビュー判断の展開・資金源別の仕訳構造・検算（MF write なし）")
+    sp.add_argument("--fy", type=int, default=2025)
+    sp.add_argument("--preview", action="store_true", help="未確定明細も推定科目で仮の仕訳を作り、構造と検算を確認する")
+    sp.set_defaults(func=cmd_close_finalize)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")

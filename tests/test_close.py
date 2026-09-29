@@ -95,3 +95,52 @@ def test_review_groups_merge_by_merchant_and_expand_to_every_transaction():
     assert g["same_merchant_other_groups"] == 1  # 同じ加盟店で推定科目が違うグループがある
     assert sorted(m["transaction_id"] for m in members) == ["1", "2", "3", "4"]
     assert {m["review_group"] for m in members if m["transaction_id"] in ("1", "2")} == {g["review_group"]}
+
+
+def test_expand_decisions_group_row_override_and_split():
+    groups = [{"review_group": "G1", "human_decision": "approve", "human_correction_account": "", "proposed_primary_account_id": "EXP"},
+              {"review_group": "G2", "human_decision": "correct", "human_correction_account": "会議費", "proposed_primary_account_id": "EXP"},
+              {"review_group": "G3", "human_decision": "split", "human_correction_account": "", "proposed_primary_account_id": "EXP"},
+              {"review_group": "G4", "human_decision": "hold", "human_correction_account": "", "proposed_primary_account_id": "EXP"},
+              {"review_group": "G5", "human_decision": "", "human_correction_account": "", "proposed_primary_account_id": "EXP"},
+              {"review_group": "G6", "human_decision": "correct", "human_correction_account": "存在しない科目", "proposed_primary_account_id": "EXP"}]
+    m = lambda i, g, rd="", rc="": {"transaction_id": i, "review_group": g, "row_decision_override": rd, "row_correction_account": rc}
+    members = [m("a", "G1"), m("b", "G1", "correct", "会議費"), m("c", "G2"), m("d", "G3"), m("e", "G3", "approve"),
+               m("f", "G4"), m("g", "G5"), m("h", "G6"), m("i", "G1", "maybe")]
+    out = {r["transaction_id"]: r for r in close.expand_decisions(groups, members, {"会議費": "MTG", "消耗品費": "EXP"})}
+    assert (out["a"]["final_status"], out["a"]["final_account_id"]) == (close.CONFIRMED, "EXP")
+    assert (out["b"]["final_account_id"], out["b"]["decision_source"]) == ("MTG", "row")  # 行の判断が優先
+    assert out["c"]["final_account_id"] == "MTG"
+    assert out["d"]["final_status"] == close.UNDECIDED and "split" in out["d"]["problem"]
+    assert out["e"]["final_status"] == close.CONFIRMED
+    assert out["f"]["final_status"] == close.HELD and out["g"]["final_status"] == close.UNDECIDED
+    assert out["h"]["final_status"] == close.INVALID and out["i"]["final_status"] == close.INVALID
+
+
+def test_funding_source_is_explicit_not_inferred_from_card_type():
+    assert close.funding_source("楽天カード", "楽天カード(Mastercard) XXXX - 2676") == close.FOUNDER_PERSONAL_CARD
+    assert close.funding_source("楽天カード", "【利用不可】楽天カード(MasterCard) XXXX - 4004") == close.FOUNDER_PERSONAL_CARD
+    assert close.funding_source("楽天カード", "楽天カード(Visa) XXXX - XXXX - XXXX - 4235") == close.FOUNDER_PERSONAL_CARD
+    assert close.funding_source("楽天カード", "楽天カード(Visa) XXXX - XXXX - XXXX - 9999") == close.UNCONFIRMED  # 新しい Visa は推測しない
+    assert close.funding_source("アメリカン・エキスプレスカード", "デルタ スカイマイル アメリカン・エキスプレス・カード 55006") == close.FOUNDER_PERSONAL_CARD
+    assert close.funding_source("新しいカード会社", "何かのカード") == close.UNCONFIRMED
+    assert close.funding_source("【法人】三井住友銀行", "三田通支店") == close.BANK
+
+
+def test_personal_card_journal_nets_payable_and_books_loan():
+    card = ("AP", "RAKUTEN")
+    use = close.journal_branches("EXPENSE", 10000, "SUPPLIES", card, close.FOUNDER_PERSONAL_CARD, "LOAN")
+    assert use == [{"debitor": {"account_id": "SUPPLIES", "sub_account_id": None, "value": 10000}, "creditor": {"account_id": "AP", "sub_account_id": "RAKUTEN", "value": 10000}},
+                   {"debitor": {"account_id": "AP", "sub_account_id": "RAKUTEN", "value": 10000}, "creditor": {"account_id": "LOAN", "sub_account_id": None, "value": 10000}}]
+    refund = close.journal_branches("INCOME", 3000, "SUPPLIES", card, close.FOUNDER_PERSONAL_CARD, "LOAN")
+    assert refund[1] == {"debitor": {"account_id": "LOAN", "sub_account_id": None, "value": 3000}, "creditor": {"account_id": "AP", "sub_account_id": "RAKUTEN", "value": 3000}}
+    corp = close.journal_branches("EXPENSE", 5000, "SUPPLIES", ("AP", "CORP"), close.CORPORATE_CARD, "LOAN")
+    assert len(corp) == 1  # 法人カードは振替なし
+    js = [{"funding": close.FOUNDER_PERSONAL_CARD, "side": "EXPENSE", "value": 10000, "branches": use},
+          {"funding": close.FOUNDER_PERSONAL_CARD, "side": "INCOME", "value": 3000, "branches": refund},
+          {"funding": close.CORPORATE_CARD, "side": "EXPENSE", "value": 5000, "branches": corp}]
+    r = close.reconcile(js, "AP", "LOAN")
+    p = r[close.FOUNDER_PERSONAL_CARD]
+    assert (p["loan_increase"], p["loan_decrease"], p["loan_net"]) == (10000, 3000, 7000)
+    assert p["payable_net"] == 0 and p["payable_net_zero_every_transaction"] and p["loan_net_equals_usage_minus_refund"]
+    assert r[close.CORPORATE_CARD]["usage_total"] == 5000 and r[close.CORPORATE_CARD]["loan_increase"] == 0

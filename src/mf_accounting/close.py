@@ -296,3 +296,118 @@ REVIEW_GROUP_COLUMNS = ["review_group", "group_size", "routing", "representative
 REVIEW_MEMBER_COLUMNS = ["review_group", "transaction_id", "transaction_date", "transaction_content", "amount", "side",
                          "connected_account", "proposed_primary_account", "confidence", "review_ai_group",
                          "row_decision_override", "row_correction_account", "row_note"]
+
+
+# ---- レビュー判断の展開（group → transaction） ------------------------------------------
+CONFIRMED, UNDECIDED, HELD, INVALID = "confirmed", "undecided", "hold", "invalid"
+
+
+def expand_decisions(groups: list[dict], members: list[dict], account_ids: dict[str, str]) -> list[dict]:
+    """review_groups.csv / review_group_members.csv の判断を明細単位に展開する。
+
+    優先順位: 行の row_decision_override（approve / correct / hold）> グループの human_decision。
+    approve → 推定科目、correct → 修正科目（科目名または ID）、split → 行の判断が必要、hold・空欄 → 未確定。
+    account_ids: 科目名 → ID（利用可能な科目のみ）。ID そのものも受け付ける。
+    """
+    gby = {g["review_group"]: g for g in groups}
+    valid_ids = set(account_ids.values())
+    resolve = lambda v: account_ids.get(v.strip()) or (v.strip() if v.strip() in valid_ids else None)
+    out = []
+    for m in members:
+        g = gby.get(m["review_group"]) or {}
+        gd, rd = (g.get("human_decision") or "").strip().lower(), (m.get("row_decision_override") or "").strip().lower()
+        if rd:
+            decision, corr, source = rd, m.get("row_correction_account") or "", "row"
+        else:
+            decision, corr, source = gd, g.get("human_correction_account") or "", "group"
+        status, acct, problem = UNDECIDED, None, ""
+        if decision == "approve":
+            acct = g.get("proposed_primary_account_id") or None
+            status, problem = (CONFIRMED, "") if acct else (INVALID, "approve だが推定科目がない")
+        elif decision == "correct":
+            acct = resolve(corr)
+            status, problem = (CONFIRMED, "") if acct else (INVALID, f"修正科目を解決できない: {corr!r}")
+        elif decision == "hold":
+            status = HELD
+        elif decision == "split":
+            problem = "split: 行の row_decision_override が未記入" if source == "group" else "split は行では使えない"
+            status = UNDECIDED if source == "group" else INVALID
+        elif decision:
+            status, problem = INVALID, f"不明な判断: {decision!r}"
+        out.append({**m, "group_decision": gd, "applied_decision": decision, "decision_source": source if decision else "",
+                    "final_status": status, "final_account_id": acct or "", "problem": problem})
+    return out
+
+
+# ---- 資金源（funding source）と最終仕訳構造 -------------------------------------------------
+# 勘定科目推定（ACCOUNT_LINEAGES）とは独立。仕訳構造（未払金 → 長期借入金の振替の有無）だけに使う。
+# (連携サービス名, サブ口座名に含まれる文字列（大文字小文字無視, None=全サブ口座）) → 資金源。上から順に最初に一致したもの。
+# 一致しない口座は "unconfirmed"（仕訳を作らず確認待ち）。カード種別から自動で推測しない。
+FOUNDER_PERSONAL_CARD, CORPORATE_CARD, BANK, OTHER, UNCONFIRMED = "founder_personal_card", "corporate_card", "bank", "other", "unconfirmed"
+FUNDING_SOURCES = [
+    ("楽天カード", "mastercard", FOUNDER_PERSONAL_CARD),  # 4004 / 9023 / 2676 / 【利用不可】（創業者個人カードの更新系列）
+    ("楽天カード", "(visa) xxxx - xxxx - xxxx - 4235", FOUNDER_PERSONAL_CARD),  # 追加 Visa。個人カード（2026-09-29 ユーザー確認）
+    ("アメリカン・エキスプレスカード", "デルタ", FOUNDER_PERSONAL_CARD),  # 創業者個人カード（2026-09-29 ユーザー確認）
+    # 法人カード（FY2025 より後に導入）は、連携口座が確定したら CORPORATE_CARD として口座単位で追加する
+    ("アメリカン・エキスプレスカード", "ポイント", OTHER),
+    ("GMOあおぞら", None, BANK),
+    ("【法人】三井住友銀行", None, BANK),
+    ("【法人】ゆうちょ銀行（ゆうちょダイレクト）", None, BANK),
+    (AMAZON_CONNECTED_ACCOUNT, None, OTHER),
+]
+FOUNDER_LOAN_ACCOUNT = "長期借入金"  # 創業者からの借入（個人カードの立替分）
+
+
+def funding_source(connected_name: str, sub_name: str) -> str:
+    for name, part, src in FUNDING_SOURCES:
+        if name == connected_name and (part is None or part.lower() in (sub_name or "").lower()):
+            return src
+    return UNCONFIRMED
+
+
+def _line(acct: tuple, value: int) -> dict:
+    return {"account_id": acct[0], "sub_account_id": acct[1], "value": value}
+
+
+def journal_branches(side: str, value: int, primary: str, source_acct: tuple, funding: str, loan_account: str) -> list[dict]:
+    """1明細の仕訳（branches: debitor / creditor）。source_acct = 連携口座の (account_id, sub_account_id)。
+
+    個人カード: 費用/未払金(カード) + 未払金(カード)/長期借入金 → 未払金は同じサブ口座で相殺され、実質 費用/長期借入金。
+    入金（返金等）は同じ構造の貸借逆。法人カード・銀行は振替なし。
+    """
+    p = (primary, None)
+    first = {"debitor": _line(p, value), "creditor": _line(source_acct, value)}
+    if side == "INCOME":
+        first = {"debitor": _line(source_acct, value), "creditor": _line(p, value)}
+    branches = [first]
+    if funding == FOUNDER_PERSONAL_CARD:
+        loan = (loan_account, None)
+        tr = {"debitor": _line(source_acct, value), "creditor": _line(loan, value)}
+        if side == "INCOME":
+            tr = {"debitor": _line(loan, value), "creditor": _line(source_acct, value)}
+        branches.append(tr)
+    return branches
+
+
+def reconcile(journals: list[dict], liability_account: str, loan_account: str) -> dict:
+    """journals: [{funding, side, value, branches}]。資金源別の件数・金額と、未払金・長期借入金の増減を検算する。"""
+    def tot(js, acct, side):
+        return sum(b[side]["value"] for j in js for b in j["branches"] if b[side]["account_id"] == acct)
+    out = {}
+    for src in sorted({j["funding"] for j in journals}):
+        js = [j for j in journals if j["funding"] == src]
+        use, ref = [j for j in js if j["side"] == "EXPENSE"], [j for j in js if j["side"] == "INCOME"]
+        kind = ("withdrawal", "deposit") if src == BANK else ("usage", "refund")  # カードの入金は返金・取消等
+        r = {"count": len(js), f"{kind[0]}_count": len(use), f"{kind[0]}_total": sum(j["value"] for j in use),
+             f"{kind[1]}_count": len(ref), f"{kind[1]}_total": sum(j["value"] for j in ref)}
+        if src != BANK:
+            ap_dr, ap_cr = tot(js, liability_account, "debitor"), tot(js, liability_account, "creditor")
+            ln_cr, ln_dr = tot(js, loan_account, "creditor"), tot(js, loan_account, "debitor")
+            per_tx_ap_zero = all(sum(b["creditor"]["value"] for b in j["branches"] if b["creditor"]["account_id"] == liability_account)
+                                 == sum(b["debitor"]["value"] for b in j["branches"] if b["debitor"]["account_id"] == liability_account) for j in js)
+            r.update({"loan_increase": ln_cr, "loan_decrease": ln_dr, "loan_net": ln_cr - ln_dr,
+                      "payable_debit_total": ap_dr, "payable_credit_total": ap_cr, "payable_net": ap_cr - ap_dr,
+                      "payable_net_zero_every_transaction": per_tx_ap_zero,
+                      "loan_net_equals_usage_minus_refund": (ln_cr - ln_dr) == r["usage_total"] - r["refund_total"] if src == FOUNDER_PERSONAL_CARD else None})
+        out[src] = r
+    return out
