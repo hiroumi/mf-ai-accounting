@@ -1288,6 +1288,177 @@ def cmd_close_final(settings: Settings, args) -> None:
     print(f"保存先: {final}")
 
 
+def cmd_close_mf_import(settings: Settings, args) -> None:
+    """決算処理: 確定仕訳（final_journals）から MF 仕訳帳インポート CSV を生成し、検証する（MF への import・write はしない）。"""
+    import csv as _csv
+    from . import close, mf_import as mi
+    fy = args.fy
+    office_code = settings.require_office_code()
+    close_dir = settings.data_dir / f"fy{fy}_close"
+    final = close_dir / "final"
+    masters = latest_run_dir(close_dir, office_code, "masters")
+    read = lambda p: list(_csv.DictReader(Path(p).open(encoding="utf-8-sig")))
+    v4 = read(final / f"fy{fy}_final_journals{args.source_suffix}.csv")
+    txs = {t["transaction_id"]: t for t in read(final / f"fy{fy}_final_transactions{args.source_suffix}.csv")}
+    accounts = load_json(masters / "accounts.json")["accounts"]
+    acc_names = {a["name"] for a in accounts if a.get("available")}
+    acc_id = {a["name"]: a["id"] for a in accounts}
+    sub_by_acct = Counter((s["account_id"], s["name"]) for s in load_json(masters / "sub_accounts.json")["sub_accounts"])
+    taxes = {t["name"] for t in load_json(masters / "taxes.json")["taxes"] if t.get("available")}
+    term = next(t for t in load_json(masters / "term_settings.json")["term_settings"] if t.get("fiscal_year") == fy)
+    _, sample_enc = mi.read_csv(Path(args.sample))
+    sample_header = next(_csv.reader(Path(args.sample).read_text(encoding=sample_enc).splitlines()[:1]))
+    exports = [mi.read_csv(Path(e)) for e in args.export]
+    periods = [tuple(p.split(":")) for p in args.export_period]
+    if len(periods) != len(exports):
+        raise ConfigError("--export と --export-period の数が一致しません。")
+    export_rows = [r for rows_, _ in exports for r in rows_]
+    export_enc = ",".join(enc for _, enc in exports)
+
+    out = final / args.output
+    if args.check_only:  # 既存のインポート CSV を変更せずに検証だけ行う
+        if not out.exists():
+            raise ConfigError(f"{out} がありません。")
+        rows = mi.read_csv(out)[0]
+        index = read(out.with_name(out.stem + "_index.csv"))
+    else:
+        rows, index = mi.to_rows(v4)
+        mi.write(out, rows)
+        write_csv(out.with_name(out.stem + "_index.csv"), index, ["取引No", "journal_no", "transaction_id", "transaction_date"])
+    rpt = out.with_name(out.stem + args.report_suffix)
+
+    # ---- 書いたファイルそのものを読み直して検証する
+    raw = out.read_bytes()
+    back_rows, back_enc = mi.read_csv(out)
+    back = mi.parse(back_rows)
+    bj = mi.journals(back)
+    v4j: dict = {}
+    for l in v4:
+        v4j.setdefault(l["journal_no"], []).append(l)
+    tid_of = {str(i["取引No"]): i["transaction_id"] for i in index}
+    jno_of = {str(i["取引No"]): i["journal_no"] for i in index}
+    no_of = {t: n for n, t in tid_of.items()}
+    checks = []
+    def add(no, check, bad, detail=""):
+        bad = sorted(map(str, bad)) if not isinstance(bad, bool) else (["NG"] if bad else [])
+        checks.append({"no": no, "check": check, "result": "fail" if bad else "pass", "count": len(bad), "detail": detail, "items": " ".join(bad)[:2000]})
+    tot = lambda ls, s: sum(int(l[f"{s}_amount"]) for l in ls)
+    add("F1", "列名・列順がサンプルと一致", list(back_rows[0].keys()) != sample_header if back_rows else True)
+    add("F2", "UTF-8（BOM なし）・LF のみ", raw.startswith(b"\xef\xbb\xbf") or b"\r" in raw, f"encoding={back_enc}")
+    add("F3", "空欄にすべき列（部門・取引先・インボイス・メモ・タグ・作成者等）が空欄", {l["取引No"] for l in back if l["blank_columns_filled"]})
+    add("F4", "日付形式 YYYY/MM/DD", {r["取引No"] for r in back_rows if not (len(r["取引日"]) == 10 and r["取引日"][4] == "/" and r["取引日"][7] == "/")})
+    add(1, "v4 の全仕訳が反映（仕訳数・transaction_id）",
+        len(bj) != len(v4j) or set(tid_of.values()) != {ls[0]["transaction_id"] for ls in v4j.values()},
+        f"import {len(bj):,} / v4 {len(v4j):,}")
+    add(2, "借方合計が v4 と一致", tot(back, "debit") != tot(v4, "debit"), f"import {tot(back, 'debit'):,} / v4 {tot(v4, 'debit'):,}")
+    add(3, "貸方合計が v4 と一致", tot(back, "credit") != tot(v4, "credit"), f"import {tot(back, 'credit'):,} / v4 {tot(v4, 'credit'):,}")
+    add(4, "借方合計 = 貸方合計（全体・仕訳ごと）",
+        {n for n, ls in bj.items() if tot(ls, "debit") != tot(ls, "credit")} | ({"TOTAL"} if tot(back, "debit") != tot(back, "credit") else set()),
+        f"借方 {tot(back, 'debit'):,} / 貸方 {tot(back, 'credit'):,}")
+    ka = lambda l, s: (l[f"{s}_account"],)
+    ks = lambda l, s: (l[f"{s}_account"], l[f"{s}_sub_account"])
+    na, nv = mi.net_by(back, ka), mi.net_by(v4, ka)
+    add(5, "勘定科目ごとの net が v4 と一致", {k[0] for k in set(na) | set(nv) if na[k] != nv[k]}, f"{len(na)}科目")
+    sa, sv = mi.net_by(back, ks), mi.net_by(v4, ks)
+    add(6, "補助科目ごとの net が v4 と一致", {"/".join(k) for k in set(sa) | set(sv) if sa[k] != sv[k]}, f"{sum(1 for k in sa if k[1])}補助科目")
+    add(7, "日付・金額・摘要の欠落がない",
+        {l["取引No"] for l in back if not l["transaction_date"] or not (l["debit_amount"] or l["credit_amount"])} | {n for n, ls in bj.items() if not ls[0]["remark"].strip()})
+    bad_acct = {l[f"{s}_account"] for l in back for s in ("debit", "credit") if l[f"{s}_account"] and l[f"{s}_account"] not in acc_names}
+    bad_sub = {f"{l[s + '_account']}/{l[s + '_sub_account']}" for l in back for s in ("debit", "credit")
+               if l[f"{s}_sub_account"] and sub_by_acct[(acc_id.get(l[f"{s}_account"]), l[f"{s}_sub_account"])] != 1}
+    add(8, "存在しない（または名前が一意でない）勘定科目・補助科目がない", bad_acct | bad_sub, "MF マスター（2026-09-30 取得）と照合")
+    add(9, "税区分がすべて FY2025 方針（対象外・税額0）", {l["取引No"] for l in back for s in ("debit", "credit")
+                                               if l[f"{s}_account"] and (l[f"{s}_tax"] != "対象外" or l[f"{s}_tax_value"] != 0)}
+        | ({"対象外がマスターにない"} if "対象外" not in taxes else set()))
+    add(10, "金額0円の仕訳行（科目がある側の金額0）がない", {l["取引No"] for l in back for s in ("debit", "credit") if l[f"{s}_account"] and l[f"{s}_amount"] <= 0})
+    same = Counter((ls[0]["transaction_date"], tuple(sorted(mi.legs(ls).items())), ls[0]["remark"]) for ls in bj.values())
+    add(11, "重複仕訳がない（1 transaction_id = 1仕訳）", [t for t, c in Counter(tid_of.values()).items() if c > 1],
+        f"参考: 日付・科目・金額・摘要がすべて同じ別明細の仕訳 {sum(c - 1 for c in same.values() if c > 1)}組（明細が別なので重複ではない）")
+    excluded = {t for t, x in txs.items() if x["status"] == close.EXCLUDED}
+    merged = {t: x["merged_into"] for t, x in txs.items() if x["status"] == close.MERGED}
+    add(12, "exclude された取引が含まれていない", excluded & set(no_of), f"exclude {len(excluded)}件")
+    add(13, "merged_into の元取引が含まれず、統合先が含まれる", (set(merged) & set(no_of)) | {t for t in merged.values() if t not in no_of}, f"統合 {len(merged)}件")
+    find = lambda pred: [t for t, x in txs.items() if pred(x)]
+    legs_of = lambda tid: mi.legs(bj[no_of[tid]]) if tid in no_of else Counter()
+    prior = find(lambda x: x["side"] == "INCOME" and (x["amount"], "アップルストア" in x["transaction_content"] or "えきねっと" in x["transaction_content"]) in (("293600", True), ("11290", True)))
+    add(14, "Apple Store 293,600・えきねっと 11,290（FY2024 購入分の返金）が含まれていない", [t for t in prior if t in no_of] + ([] if len(prior) == 2 else ["対象明細が2件でない"]))
+    smbc = "【法人】三井住友銀行三田通支店普通8679590"
+    dl = find(lambda x: x["amount"] == "4999671" and "デロイト" in x["transaction_content"])
+    ok15 = len(dl) == 1 and legs_of(dl[0]) == Counter({("D", "普通預金", smbc, 4999671): 1, ("C", "売上高", "", 4999671): 1})
+    add(15, "Deloitte 4,999,671 が売上高で含まれている", not ok15, f"{txs[dl[0]]['transaction_date']} 取引No {no_of.get(dl[0])}" if dl else "")
+    rk = find(lambda x: x["override"] == "confirm_refund")
+    visa = "楽天カード楽天カード(Visa)XXXX - XXXX - "
+    exp16 = lambda t: Counter({("D", "未払金", visa, int(txs[t]["amount"])): 1, ("C", "旅費交通費", "", int(txs[t]["amount"])): 1,
+                              ("D", "長期借入金", "", int(txs[t]["amount"])): 1, ("C", "未払金", visa, int(txs[t]["amount"])): 1})
+    add(16, "楽天トラベル 5,900・4,060 の返金仕訳が含まれている", [t for t in rk if legs_of(t) != exp16(t)]
+        + ([] if sorted(int(txs[t]["amount"]) for t in rk) == [4060, 5900] else ["対象が 5,900・4,060 でない"]),
+        ", ".join(f"取引No {no_of.get(t)}" for t in rk))
+    jn = find(lambda x: x["override"] == "set_counter_sub_account" and x["final_sub_account"] == "城南信用金庫")
+    add(17, "2026/3/4・4/6 の城南信用金庫への口座間振替",
+        [t for t in jn if legs_of(t) != Counter({("D", "普通預金", "城南信用金庫", int(txs[t]["amount"])): 1, ("C", "普通預金", smbc, int(txs[t]["amount"])): 1})]
+        + ([] if sorted((txs[t]["transaction_date"], txs[t]["amount"]) for t in jn) == [("2026-03-04", "30000"), ("2026-04-06", "1000000")] else ["対象が 3/4 30,000・4/6 1,000,000 でない"]))
+    rp = find(lambda x: x["override"] == "set_account" and x["final_account"] == "長期借入金")
+    add(18, "その他5件の出金が長期借入金返済",
+        [t for t in rp if legs_of(t) != Counter({("D", "長期借入金", "", int(txs[t]["amount"])): 1, ("C", "普通預金", smbc, int(txs[t]["amount"])): 1})]
+        + ([] if len(rp) == 5 else [f"対象が {len(rp)}件"]), f"合計 {sum(int(txs[t]['amount']) for t in rp):,}")
+    diff = []
+    for n, ls in bj.items():
+        src = sorted(v4j[jno_of[n]], key=lambda l: int(l["branch"]))
+        if len(src) != len(ls):
+            diff.append(f"{n}:行数")
+            continue
+        for a, b in zip(ls, src):
+            diff += [f"{n}:{f}" for f in ("transaction_date", "debit_account", "debit_sub_account", "debit_tax", "credit_account", "credit_sub_account", "credit_tax", "remark") if a[f] != b[f]]
+            diff += [f"{n}:{f}" for f in ("debit_amount", "debit_tax_value", "credit_amount", "credit_tax_value") if a[f] != int(b[f])]
+    add("R", "再読込した CSV が v4 と全項目一致（仕訳ごと・行ごと）", diff, f"{len(back):,}行を比較")
+
+    # ---- 既存 MF 仕訳との重複候補（開始仕訳は除く。自動で除外しない）
+    # 複数のエクスポートを結合するため、既存側の取引No はエクスポートごとに区別する
+    exj = {}
+    for (rows_, _), (plo, phi) in zip(exports, periods):
+        for no, ls in mi.journals(mi.parse([r for r in rows_ if r.get("MF仕訳タイプ") != "開始仕訳"])).items():
+            exj[f"{plo[:7]}#{no}"] = ls
+    covered = lambda d: any(plo <= d <= phi for plo, phi in periods)
+    cands = mi.duplicate_candidates({n: ls for n, ls in bj.items() if covered(ls[0]["transaction_date"])}, exj)
+    fmt = lambda c: "; ".join(f"{k[0]} {k[1]}{'[' + k[2] + ']' if k[2] else ''} {k[3]:,}" for k in sorted(c))
+    dup_rows = [
+        {"level": c["level"], "import_取引No": c["import_no"], "transaction_id": tid_of[str(c["import_no"])], "import_date": c["date"],
+         "import_legs": fmt(c["import_legs"]), "import_摘要": c["import_remark"], "existing_取引No": c["existing_no"], "existing_date": c["existing_date"],
+         "existing_legs": fmt(c["existing_legs"]), "existing_摘要": c["existing_remark"], "existing_作成日時": c["existing_created"]}
+        for c in sorted(cands, key=lambda c: (["high", "medium", "low"].index(c["level"]), c["date"]))]
+    # インポート CSV 内の同一内容の仕訳（別の明細だが、日付・科目・補助科目・金額・摘要がすべて同じ）
+    internal = mi.internal_duplicates(bj)
+    for g in internal:
+        for n in g["nos"]:
+            dup_rows.append({"level": "internal", "import_取引No": n, "transaction_id": tid_of[str(n)], "import_date": g["date"],
+                             "import_legs": fmt(g["legs"]), "import_摘要": g["remark"],
+                             "existing_取引No": " ".join(str(x) for x in g["nos"] if x != n), "existing_date": g["date"],
+                             "existing_legs": "（インポート CSV 内の同一内容の仕訳）", "existing_摘要": g["remark"], "existing_作成日時": ""})
+    write_csv(rpt.with_name(rpt.name + "_duplicate_candidates.csv"), dup_rows,
+              ["level", "import_取引No", "transaction_id", "import_date", "import_legs", "import_摘要", "existing_取引No", "existing_date",
+               "existing_legs", "existing_摘要", "existing_作成日時"])
+    unchecked = [n for n, ls in bj.items() if not covered(ls[0]["transaction_date"])]
+    period_txt = ", ".join(f"{a}〜{b}" for a, b in periods)
+    checks.append({"no": "D", "check": "既存 MF 仕訳との重複候補（自動で除外しない）", "result": "review" if cands else "pass", "count": len(cands),
+                   "detail": (", ".join(f"{k} {v}" for k, v in Counter(c["level"] for c in cands).items()) or "なし")
+                             + f"（照合 {len(bj) - len(unchecked):,}仕訳, 期間 {period_txt}, 既存 {len(exj)}仕訳）", "items": ""})
+    checks.append({"no": "I", "check": "インポート CSV 内の同一内容の仕訳（別明細。自動で変更しない）", "result": "review" if internal else "pass",
+                   "count": len(internal), "detail": "; ".join(f"{g['date']} {g['remark']} ×{len(g['nos'])}（取引No {', '.join(map(str, g['nos']))}）" for g in internal), "items": ""})
+    checks.append({"no": "U", "check": "既存 MF 仕訳との照合未実施（エクスポート期間外）", "result": "not_checked" if unchecked else "pass", "count": len(unchecked),
+                   "detail": f"{term['start_date']}〜{term['end_date']} のうちエクスポートがない期間の仕訳" if unchecked else f"全期間 {term['start_date']}〜{term['end_date']} を照合", "items": ""})
+    write_csv(rpt.with_name(rpt.name + "_validation.csv"), checks, ["no", "check", "result", "count", "detail", "items"])
+    summary = {"output": str(out), "rows": len(rows), "journals": len(bj), "debit_total": tot(back, "debit"), "credit_total": tot(back, "credit"),
+               "sample": args.sample, "sample_encoding": sample_enc, "export": args.export, "export_encoding": export_enc,
+               "export_journals_excluding_opening": len(exj), "export_periods": periods, "checked_journals": len(bj) - len(unchecked),
+               "unchecked_journals": len(unchecked), "duplicate_candidates": dict(Counter(c["level"] for c in cands)),
+               "internal_identical_groups": len(internal), "check_only": args.check_only,
+               "failed_checks": [c["no"] for c in checks if c["result"] == "fail"]}
+    save_json(rpt.with_name(rpt.name + "_summary.json"), summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=1))
+    for c in checks:
+        print(f"[{c['no']}] {c['result']:11s} {c['check']}: {c['count']} {c['detail']}")
+
+
 def cmd_llm_run(settings: Settings, args) -> None:
     rows, accounts, out = _phase4_context(settings)
     dry = out / args.name
@@ -1730,6 +1901,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--overrides", help="明細単位の上書き（final_overrides.csv: transaction_id, action, counter_sub_account, target_transaction_id, reason）")
     sp.add_argument("--suffix", default="", help="出力ファイル名の接尾辞（例: _v2）")
     sp.set_defaults(func=cmd_close_final)
+
+    sp = sub.add_parser("close-mf-import", help="決算処理: 確定仕訳から MF 仕訳帳インポート CSV を生成・検証（MF への import・write はしない）")
+    sp.add_argument("--fy", type=int, default=2025)
+    sp.add_argument("--source-suffix", default="_v4", help="元にする final_journals / final_transactions の接尾辞")
+    sp.add_argument("--overrides", required=True)
+    sp.add_argument("--sample", required=True, help="MF の仕訳帳インポート用サンプル CSV")
+    sp.add_argument("--export", action="append", required=True, help="MF 形式でエクスポートした既存仕訳 CSV（複数指定可）")
+    sp.add_argument("--export-period", action="append", required=True, help="各エクスポートの対象期間 YYYY-MM-DD:YYYY-MM-DD（--export と同じ順）")
+    sp.add_argument("--output", default="fy2025_mf_import_v1.csv")
+    sp.add_argument("--check-only", action="store_true", help="既存のインポート CSV を変更せず、検証と重複チェックだけ行う")
+    sp.add_argument("--report-suffix", default="", help="検証レポートのファイル名の接尾辞（例: _dupcheck_full）")
+    sp.set_defaults(func=cmd_close_mf_import)
 
     sp = sub.add_parser("csv", help="Step 5: CSV変換")
     sp.add_argument("--journals-run", help="仕訳の取得ディレクトリ（既定: 最新）")
